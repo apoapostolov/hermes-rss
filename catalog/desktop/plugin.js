@@ -162,7 +162,7 @@ function validateSummary(text, body) {
 }
 
 // src/library.mjs
-var EMPTY = () => ({ feeds: [], articles: [] });
+var EMPTY = () => ({ feeds: [], articles: [], articleCache: {} });
 var database;
 function openDatabase() {
   if (!database)
@@ -202,6 +202,33 @@ async function transact(owner, mutate) {
     );
   });
 }
+function rememberCapture(library, article, body) {
+  if (!library.articleCache) library.articleCache = {};
+  const entry = { body: String(body || "").slice(0, 6e4), image: article.image || "", at: Date.now() };
+  if (article.url) library.articleCache[article.url] = entry;
+  if (article.identity) library.articleCache[article.identity] = entry;
+}
+function applyCachedBody(library, article) {
+  if (!article || article.captured) return article;
+  const hit = article.url && library.articleCache?.[article.url] || article.identity && library.articleCache?.[article.identity];
+  if (hit?.body && hit.body.length > (article.body || "").length) {
+    article.body = hit.body;
+    article.captured = true;
+    if (hit.image && !article.image) article.image = hit.image;
+  }
+  return article;
+}
+function pruneArticleCache(library) {
+  if (!library.articleCache) return;
+  const live = new Set();
+  for (const article of library.articles) {
+    if (article.url) live.add(article.url);
+    if (article.identity) live.add(article.identity);
+  }
+  for (const key of Object.keys(library.articleCache)) {
+    if (!live.has(key)) delete library.articleCache[key];
+  }
+}
 function safeUrl(raw) {
   const url = new URL(raw);
   if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.port && !["80", "443"].includes(url.port))
@@ -228,7 +255,17 @@ function mergeFeed(library, feedId, parsed) {
     if (old) {
       if (old.body !== item.body || old.title !== item.title || old.url !== item.url)
         old.actions = old.actions.map((a) => ({ ...a, stale: true }));
+      const prevBody = old.body;
+      const prevCaptured = old.captured;
+      const prevImage = old.image;
       Object.assign(old, item, { feed_title: feed.title });
+      if (prevCaptured || (prevBody && prevBody.length > (item.body || "").length)) {
+        old.body = prevBody;
+        old.captured = true;
+        old.image = prevImage || item.image;
+      }
+      applyCachedBody(library, old);
+      if (old.captured) rememberCapture(library, old, old.body);
     } else {
       const article = {
         ...item,
@@ -240,10 +277,11 @@ function mergeFeed(library, feedId, parsed) {
         actions: [],
         received_at: (/* @__PURE__ */ new Date()).toISOString()
       };
+      applyCachedBody(library, article);
       library.articles.push(article);
       byIdentity.set(item.identity, article);
       added++;
-      if (article.url) fresh.push(article);
+      if (article.url && !article.captured) fresh.push(article);
     }
   }
   const unsaved = library.articles.filter((a) => a.feed_id === feedId && !a.is_saved).sort(
@@ -253,6 +291,7 @@ function mergeFeed(library, feedId, parsed) {
   );
   const remove = new Set(unsaved.slice(300).map((a) => a.id));
   library.articles = library.articles.filter((a) => !remove.has(a.id));
+  pruneArticleCache(library);
   return { added, fresh: fresh.map((a) => ({ id: a.id, url: a.url })) };
 }
 function parseOpml(content) {
@@ -366,27 +405,7 @@ function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = nu
           if (!feed) throw new Error("Subscription not found.");
           try {
             const result = await fetchFeed2(feed.url);
-            const outcome = await write((library) => mergeFeed(library, feed.id, result));
-            if (outcome.added > 0 && Array.isArray(body.captureFull) && body.captureFull.includes(feed.id)) {
-              let ok = 0;
-              for (const freshItem of outcome.fresh.slice(0, 10)) {
-                try {
-                  const fullBody = await captureFn(freshItem.url);
-                  await write((library2) => {
-                    const target = library2.articles.find((a) => a.id === freshItem.id);
-                    if (target && fullBody && fullBody.length > target.body.length) {
-                      target.body = fullBody;
-                      target.captured = true;
-                    }
-                  });
-                  ok++;
-                } catch {
-                  // Paywalls, JS-only pages, and bot blocks keep the feed excerpt.
-                }
-              }
-              outcome.captured = ok;
-            }
-            return outcome;
+            return await write((library) => mergeFeed(library, feed.id, result));
           } catch (error) {
             await write((library) => {
               const current = library.feeds.find((f) => f.id === feed.id);
@@ -432,6 +451,7 @@ function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = nu
               article3.body = body.body.slice(0, 6e4);
               article3.captured = true;
               article3.actions = article3.actions.map((a) => ({ ...a, stale: true }));
+              rememberCapture(library2, article3, article3.body);
             }
           });
         if (parts[2] === "actions" && method === "POST")
@@ -445,9 +465,10 @@ function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = nu
             delete article2.actions[0].source_body;
             article2.actions = article2.actions.slice(0, 20);
           });
-        const article = (await read()).articles.find((a) => a.id === parts[1]);
+        const library = await read();
+        const article = library.articles.find((a) => a.id === parts[1]);
         if (!article) throw new Error("Article not found.");
-        return article;
+        return applyCachedBody(library, article);
       }
       const library = await read(), q = (url.searchParams.get("q") || "").trim().toLowerCase();
       const exclude = (url.searchParams.get("exclude") || "").trim().toLowerCase();
@@ -463,7 +484,10 @@ function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = nu
         (a, b) => (b.published_at || b.received_at).localeCompare(
           a.published_at || a.received_at
         )
-      ).slice(0, Number(url.searchParams.get("limit")) || 100).map((a) => ({ ...a, excerpt: a.body.slice(0, 240) }));
+      ).slice(0, Number(url.searchParams.get("limit")) || 100).map((a) => {
+        applyCachedBody(library, a);
+        return { ...a, excerpt: plainText(a.body).slice(0, 240) };
+      });
     }
     if (path === "/opml/import") {
       const feeds = parseOpml(body.content);
@@ -495,22 +519,21 @@ function currentOwner(host2) {
 function publishLibraryChange(owner) {
   window.dispatchEvent(new CustomEvent("hermes-rss-library-changed", { detail: { owner } }));
 }
-async function refreshSubscriptions(library, { feedId = null, shouldContinue = () => true, captureFeedIds = [] } = {}) {
+async function refreshSubscriptions(library, { feedId = null, shouldContinue = () => true } = {}) {
   const feeds = await library("/feeds");
   let added = 0, failed = 0;
+  const fresh = [];
   for (const feed of feeds) {
     if (!shouldContinue()) break;
     if (feedId && feed.id !== feedId) continue;
     try {
-      const result = await library(`/feeds/${feed.id}/refresh`, {
-        method: "POST",
-        body: { captureFull: captureFeedIds === null || captureFeedIds.includes(feed.id) ? [feed.id] : [] }
-      });
-      added += result.added;
+      const result = await library(`/feeds/${feed.id}/refresh`, { method: "POST", body: {} });
+      added += result.added || 0;
+      if (Array.isArray(result.fresh)) fresh.push(...result.fresh);
     }
     catch { failed++; }
   }
-  return { added, failed };
+  return { added, failed, fresh };
 }
 function startAutoRefresh(ctx, host2, options = {}) {
   const schedule = options.setInterval || setInterval;
@@ -541,7 +564,9 @@ function startAutoRefresh(ctx, host2, options = {}) {
       if (now() - Number(ctx.storage.get(`lastRefresh:${owner}`, 0)) < period) return;
       const canContinue = () => !stopped && currentOwner(host2) === owner && readSettings(ctx, owner).autoRefresh;
       if (!canContinue()) return;
-      await refreshSubscriptions(makeLibrary(owner), { shouldContinue: canContinue });
+      await refreshSubscriptions(makeLibrary(owner), { shouldContinue: canContinue }).then((result) => {
+        if (readSettings(ctx, owner).fullCapture && result.fresh?.length) captureEnqueue(owner, result.fresh);
+      });
       ctx.storage.set(`lastRefresh:${owner}`, now());
       if (!stopped) notify(owner);
     };
@@ -556,6 +581,105 @@ function startAutoRefresh(ctx, host2, options = {}) {
   const timer = schedule(() => { void tick(); }, 15000);
   void tick();
   return () => { stopped = true; unschedule(timer); };
+}
+
+var captureEnqueue = (owner, items, options) => 0;
+var captureActive = 0;
+var captureWaiters = [];
+function withCaptureSlot(work) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      captureActive++;
+      Promise.resolve().then(work).then(resolve, reject).finally(() => {
+        captureActive--;
+        const next = captureWaiters.shift();
+        if (next) next();
+      });
+    };
+    if (captureActive < 2) run();
+    else captureWaiters.push(run);
+  });
+}
+function startCaptureWorker(ctx, host2) {
+  let stopped = false;
+  const active = new Set();
+  const CONCURRENCY = 2;
+  const MAX_QUEUE = 80;
+  const MAX_ATTEMPTS = 2;
+  const storeKey = (owner) => `captureQueue:${owner}`;
+  const load = (owner) => {
+    const raw = ctx.storage.get(storeKey(owner), []) || [];
+    return Array.isArray(raw) ? raw.filter((j) => j && j.id && j.url) : [];
+  };
+  const save = (owner, q) => ctx.storage.set(storeKey(owner), q.slice(0, MAX_QUEUE));
+  const enqueue = (owner, items, { front = false } = {}) => {
+    if (stopped || !items?.length) return 0;
+    let q = load(owner);
+    const have = new Map(q.map((j) => [j.id, j]));
+    const incoming = [];
+    for (const item of items) {
+      if (!item?.id || !item?.url) continue;
+      if (have.has(item.id)) {
+        if (front) {
+          const existing = have.get(item.id);
+          q = [existing, ...q.filter((j) => j.id !== item.id)];
+        }
+        continue;
+      }
+      have.set(item.id, item);
+      incoming.push({ id: item.id, url: item.url, attempts: 0 });
+    }
+    if (incoming.length) q = front ? incoming.concat(q) : q.concat(incoming);
+    save(owner, q);
+    void pump();
+    return incoming.length;
+  };
+  async function pump() {
+    if (stopped) return;
+    const owner = currentOwner(host2);
+    while (!stopped && active.size < CONCURRENCY) {
+      const q = load(owner);
+      const job = q.find((j) => !active.has(j.id));
+      if (!job) break;
+      active.add(job.id);
+      void runJob(owner, job).finally(() => {
+        active.delete(job.id);
+        if (!stopped) void pump();
+      });
+    }
+  }
+  async function runJob(owner, job) {
+    const library = createLibrary(owner, (url2) => fetchFeed(host2, url2), transact);
+    try {
+      const article = await library(`/articles/${job.id}`);
+      if (!article?.url || article.captured) {
+        save(owner, load(owner).filter((j) => j.id !== job.id));
+        return;
+      }
+      const fullBody = await captureArticle(host2, job.url);
+      if (stopped || currentOwner(host2) !== owner) return;
+      if (fullBody && fullBody.length > (article.body || "").length) {
+        await library(`/articles/${job.id}/capture`, { method: "POST", body: { body: fullBody } });
+        publishLibraryChange(owner);
+      }
+      save(owner, load(owner).filter((j) => j.id !== job.id));
+    } catch {
+      if (stopped || currentOwner(host2) !== owner) return;
+      const q = load(owner);
+      const cur = q.find((j) => j.id === job.id);
+      if (!cur) return;
+      cur.attempts = (cur.attempts || 0) + 1;
+      if (cur.attempts >= MAX_ATTEMPTS) save(owner, q.filter((j) => j.id !== job.id));
+      else {
+        save(owner, q.filter((j) => j.id !== job.id).concat([cur]));
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+  }
+  captureEnqueue = enqueue;
+  void pump();
+  const timer = setInterval(() => { if (!stopped) void pump(); }, 4000);
+  return () => { stopped = true; clearInterval(timer); captureEnqueue = () => 0; };
 }
 
 // src/feed-transport.mjs
@@ -786,9 +910,7 @@ function parseFeed(xml, base) {
     const mediaNode = [...entry.getElementsByTagName("*")].find((n) => /^media:thumbnail$|^media:content$/i.test(n.nodeName) && (n.getAttribute("url") || "").startsWith("http"));
     const inlineImg = /<img[\s>][^>]*\bsrc=["']?(https?:\/\/[^"'\s>]+)/i.exec(rawContent || "")?.[1];
     const image = enclosure?.getAttribute("url") || mediaNode?.getAttribute("url") || inlineImg || "";
-    const body = plainText(
-      rawContent || ""
-    ).slice(0, 16e3);
+    const body = feedItemBody(rawContent);
     const title2 = plainText(text(child(entry, "title"))).slice(0, 1e3) || "Untitled article";
     const rawDate = text(
       child(entry, "published", "pubdate", "updated", "date")
@@ -808,15 +930,57 @@ function parseFeed(xml, base) {
 async function captureArticle(host2, rawUrl) {
   const route = await currentRoute(host2);
   const owner = JSON.stringify([route.connectionId, route.profile]);
-  const previous = pendingFetches.get(owner) || Promise.resolve();
-  const work = previous.catch(() => {
-  }).then(() => captureArticleNow(host2, rawUrl, route, owner));
-  pendingFetches.set(owner, work);
-  try {
-    return await work;
-  } finally {
-    if (pendingFetches.get(owner) === work) pendingFetches.delete(owner);
+  return withCaptureSlot(() => captureArticleNow(host2, rawUrl, route, owner));
+}
+function httpsSrc(value) {
+  const v = String(value || "").trim();
+  if (!v || /^data:/i.test(v)) return "";
+  if (/^https?:\/\//i.test(v)) return v;
+  if (v.startsWith("//")) return "https:" + v;
+  return "";
+}
+function imgSrcFrom(el) {
+  const srcset = (el.getAttribute("srcset") || el.getAttribute("data-srcset") || "").split(",")[0].trim().split(/\s+/)[0];
+  for (const c of [el.getAttribute("src"), el.getAttribute("data-src"), el.getAttribute("data-original"), el.getAttribute("data-lazy-src"), srcset]) {
+    const u = httpsSrc(c);
+    if (u) return u;
   }
+  return "";
+}
+function isTrackingPixel(el) {
+  return Number(el.getAttribute("width")) === 1 || Number(el.getAttribute("height")) === 1;
+}
+function tableToMarkdown(table) {
+  const rows = [...table.querySelectorAll("tr")].map((tr) =>
+    [...tr.children].filter((c) => /^(th|td)$/i.test(c.localName)).map((c) => c.textContent.replace(/\|/g, "\\|").replace(/\s+/g, " ").trim())
+  ).filter((r) => r.length);
+  if (!rows.length) return "";
+  const width = Math.max(...rows.map((r) => r.length));
+  const norm = rows.map((r) => {
+    const x = r.slice();
+    while (x.length < width) x.push("");
+    return x;
+  });
+  const head = norm[0];
+  const sep = head.map(() => "---");
+  return [`| ${head.join(" | ")} |`, `| ${sep.join(" | ")} |`, ...norm.slice(1).map((r) => `| ${r.join(" | ")} |`)].join("\n");
+}
+function inlineMarkdown(node) {
+  const clone = node.cloneNode(true);
+  for (const img of [...clone.querySelectorAll("img")]) {
+    if (isTrackingPixel(img)) { img.remove(); continue; }
+    const src = imgSrcFrom(img);
+    const alt = (img.getAttribute("alt") || "").replace(/[[\]]/g, "");
+    if (src) img.replaceWith(document.createTextNode(`![${alt}](${src})`));
+    else img.remove();
+  }
+  for (const a of [...clone.querySelectorAll("a[href]")]) {
+    const href = httpsSrc(a.getAttribute("href"));
+    const label = a.textContent.replace(/\s+/g, " ").trim() || href;
+    if (href) a.replaceWith(document.createTextNode(`[${label}](${href})`));
+    else a.replaceWith(document.createTextNode(a.textContent));
+  }
+  return clone.textContent.replace(/[^\S\n]+/g, " ").trim();
 }
 function extractReadable(html) {
   const cleaned = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<noscript[\s\S]*?<\/noscript>/gi, "").replace(/<svg[\s\S]*?<\/svg>/gi, "").replace(/<form[\s\S]*?<\/form>/gi, "").replace(/<nav[\s\S]*?<\/nav>/gi, "").replace(/<aside[\s\S]*?<\/aside>/gi, "").replace(/<footer[\s\S]*?<\/footer>/gi, "").replace(/<!--[\s\S]*?-->/g, "");
@@ -829,27 +993,47 @@ function extractReadable(html) {
   const template = document.createElement("template");
   template.innerHTML = scope;
   template.content.querySelectorAll("script,style,noscript,svg,form,iframe,button,input,select,textarea,nav,aside,footer,header,[aria-hidden=true]").forEach((n) => n.remove());
-  const candidates = [...template.content.querySelectorAll("p,li,blockquote,pre,h1,h2,h3,h4")];
-  let text = "";
-  if (candidates.length >= 3) {
-    const seen = /* @__PURE__ */ new Set();
-    const parts = [];
-    for (const node of candidates) {
-      const name = node.localName;
-      const content = node.textContent.replace(/[^\S\n]+/g, " ").trim();
-      if (!content || content.length < 25 && !name.startsWith("h")) continue;
-      const key = content.slice(0, 80).toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      if (name === "p" || name === "blockquote" || name === "pre")
-        parts.push({ tag: name, text: content });
-      else if (name === "li") parts.push({ tag: "li", text: content });
-      else parts.push({ tag: `h${Math.min(3, Number(name[1]) || 3)}`, text: content });
+  const nodes = [...template.content.querySelectorAll("p,li,blockquote,pre,h1,h2,h3,h4,img,figure,table")];
+  const parts = [];
+  const seen = new Set();
+  for (const node of nodes) {
+    if (node.closest("table") && node.localName !== "table") continue;
+    if (node.localName === "img" && node.closest("figure,p,li,h1,h2,h3,h4")) continue;
+    if (node.localName === "p" && node.closest("li,blockquote,figure")) continue;
+    if (node.localName === "table") {
+      const md = tableToMarkdown(node);
+      if (md) parts.push(md);
+      continue;
     }
-    text = parts.map((part) => part.tag.startsWith("h") ? `\n\n## ${part.text}\n\n` : part.tag === "li" ? `\u2022 ${part.text}` : part.text).join("\n\n");
-  } else {
-    template.content.querySelectorAll("p,div,li,br,h1,h2,h3,blockquote").forEach((n) => n.append("\n"));
-    text = template.content.textContent.replace(/[^\S\n]+/g, " ").replace(/\n\s*\n/g, "\n\n").trim();
+    if (node.localName === "figure" || node.localName === "img") {
+      const img = node.localName === "img" ? node : node.querySelector("img");
+      if (!img || isTrackingPixel(img)) continue;
+      const src = imgSrcFrom(img);
+      if (!src) continue;
+      const cap = (node.querySelector && node.querySelector("figcaption")?.textContent.replace(/\s+/g, " ").trim()) || (img.getAttribute("alt") || "").replace(/[[\]]/g, "");
+      parts.push(`![${cap}](${src})`);
+      continue;
+    }
+    const name = node.localName;
+    const content = name === "pre" ? node.textContent.replace(/\s+$/g, "").trim() : inlineMarkdown(node);
+    if (!content || content.length < 2) continue;
+    if (content.length < 25 && !name.startsWith("h") && !/!\[/.test(content)) continue;
+    const key = content.slice(0, 80).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (name.startsWith("h")) parts.push(`## ${content}`);
+    else if (name === "li") parts.push(`\u2022 ${content}`);
+    else if (name === "blockquote") parts.push(`> ${content}`);
+    else if (name === "pre") parts.push("```\n" + content + "\n```");
+    else parts.push(content);
+  }
+  let text = "";
+  let prevLi = false;
+  for (const piece of parts) {
+    const isLi = piece.startsWith("\u2022 ");
+    const gap = text ? (prevLi && isLi ? "\n" : "\n\n") : "";
+    text += gap + piece;
+    prevLi = isLi;
   }
   return text.replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -913,9 +1097,7 @@ async function captureArticleNow(host2, rawUrl, route, owner) {
   const text = extractReadable(html);
   if (!text || text.length < 200)
     throw new Error("No readable article text found on the page.");
-  const leadImage = /<img[^>]*\bsrc=["']?(https?:\/\/[^"'\s>]+)[^>]*>/i.exec(text)?.[1] || "";
-  const body = "![](" + leadImage + ")\n\n" + plainText(text).slice(0, 6e4);
-  return leadImage ? body : body.replace(/^!\[\]\([^)]*\)\n\n/, "");
+  return text.slice(0, 6e4);
 }
 function escapeHtml(value) {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -928,30 +1110,78 @@ function renderInline(escaped) {
     .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>');
 }
-function bodyToRichHtml(raw) {
+function feedItemBody(rawContent) {
+  const raw = String(rawContent || "");
+  if (!raw) return "";
+  if (!/<\/?(p|div|h[1-6]|ul|ol|li|img|a|blockquote|table|br|figure)\b/i.test(raw))
+    return plainText(raw).slice(0, 16e3);
+  const t = document.createElement("template");
+  t.innerHTML = raw;
+  let html = t.innerHTML;
+  const first = t.content.firstElementChild;
+  if (first && t.content.childElementCount === 1 && /content|encoded|description|summary/i.test(first.localName))
+    html = first.innerHTML;
+  return html.slice(0, 24e3);
+}
+function sanitizeRichHtml(source) {
+  const template = document.createElement("template");
+  template.innerHTML = source;
+  template.content.querySelectorAll("script,style,noscript,iframe,object,embed,form,button,input,select,textarea,link,meta,svg").forEach((n) => n.remove());
+  for (const image of [...template.content.querySelectorAll("img")]) {
+    if (isTrackingPixel(image)) { image.remove(); continue; }
+    const src = imgSrcFrom(image);
+    if (!src) { image.remove(); continue; }
+    image.setAttribute("src", src);
+    image.setAttribute("loading", "lazy");
+    if (!image.getAttribute("alt")) image.setAttribute("alt", "");
+  }
+  for (const node of template.content.querySelectorAll("*")) {
+    for (const attribute of [...node.attributes]) {
+      const name = attribute.name.toLowerCase();
+      const allowed = name === "href" && node.localName === "a" || name === "src" && node.localName === "img" || name === "alt" || name === "title" || name === "colspan" || name === "rowspan" || name === "loading" && node.localName === "img";
+      if (!allowed || name === "href" && !/^https?:/i.test(attribute.value) || name === "src" && !/^https?:/i.test(attribute.value))
+        node.removeAttribute(attribute.name);
+    }
+  }
+  for (const anchor of template.content.querySelectorAll("a[href]")) {
+    anchor.setAttribute("target", "_blank");
+    anchor.setAttribute("rel", "noreferrer noopener");
+  }
+  for (const table of [...template.content.querySelectorAll("table")]) {
+    if (table.parentElement && table.parentElement.classList.contains("rss-table-wrap")) continue;
+    const wrap = document.createElement("div");
+    wrap.className = "rss-table-wrap";
+    table.replaceWith(wrap);
+    wrap.appendChild(table);
+  }
+  return template.innerHTML;
+}
+function withLeadImage(html, lead) {
+  const src = httpsSrc(lead);
+  if (!src || html.includes(src)) return html;
+  return `<p class="rss-lead"><img src="${escapeHtml(src)}" alt="" loading="lazy"></p>` + html;
+}
+function mdTableHtml(rows) {
+  const cells = rows.map((r) => r.replace(/^\||\|$/g, "").split("|").map((c) => c.trim()));
+  if (cells.length < 2) return "";
+  const isSep = (row) => row.every((c) => /^:?-+:?$/.test(c.replace(/\s/g, "")));
+  let head = cells[0];
+  let body = cells.slice(1);
+  if (body[0] && isSep(body[0])) body = body.slice(1);
+  else { head = null; body = cells; }
+  const width = Math.max(...(head ? [head, ...body] : body).map((r) => r.length));
+  const pad = (r) => { const x = r.slice(); while (x.length < width) x.push(""); return x; };
+  const cell = (c) => `<td>${renderInline(escapeHtml(c))}</td>`;
+  let html = '<div class="rss-table-wrap"><table>';
+  if (head) html += "<thead><tr>" + pad(head).map((c) => `<th>${renderInline(escapeHtml(c))}</th>`).join("") + "</tr></thead>";
+  html += "<tbody>" + body.map((r) => "<tr>" + pad(r).map(cell).join("") + "</tr>").join("") + "</tbody></table></div>";
+  return html;
+}
+function bodyToRichHtml(raw, lead) {
   const source = String(raw || "");
-  const looksLikeHtml = /<\/?(p|div|h[1-6]|ul|ol|li|img|a|blockquote|table|br)\b/i.test(source);
+  const looksLikeHtml = /<\/?(p|div|h[1-6]|ul|ol|li|img|a|blockquote|table|br|figure)\b/i.test(source);
   if (looksLikeHtml) {
-    const template = document.createElement("template");
-    template.innerHTML = source;
-    template.content.querySelectorAll("script,style,noscript,iframe,object,embed,form,button,input,select,textarea,link,meta,svg").forEach((n) => n.remove());
-    for (const node of template.content.querySelectorAll("*")) {
-      for (const attribute of [...node.attributes]) {
-        const name = attribute.name.toLowerCase();
-        const allowed = name === "href" && node.localName === "a" || name === "src" && node.localName === "img" || name === "alt" || name === "title" || name === "colspan" || name === "rowspan";
-        if (!allowed || name === "href" && !/^https?:/i.test(attribute.value) || name === "src" && !/^https?:/i.test(attribute.value))
-          node.removeAttribute(attribute.name);
-      }
-    }
-    for (const anchor of template.content.querySelectorAll("a[href]")) {
-      anchor.setAttribute("target", "_blank");
-      anchor.setAttribute("rel", "noreferrer noopener");
-    }
-    for (const image of template.content.querySelectorAll("img")) {
-      image.setAttribute("loading", "lazy");
-      if (!image.getAttribute("alt")) image.setAttribute("alt", "");
-    }
-    return { html: template.innerHTML, isHtml: true };
+    return { html: withLeadImage(sanitizeRichHtml(source), lead), isHtml: true };
   }
   const lines = source.split(/\n/);
   const out = [];
@@ -960,7 +1190,8 @@ function bodyToRichHtml(raw) {
     if (paragraph.length) { out.push(`<p>${renderInline(escapeHtml(paragraph.join(" ")))}</p>`); paragraph = []; }
   };
   const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
-  for (const lineRaw of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const lineRaw = lines[i];
     const line = lineRaw.replace(/\s+$/, "");
     const trimmed = line.trim();
     if (trimmed.startsWith("```")) {
@@ -970,7 +1201,25 @@ function bodyToRichHtml(raw) {
       continue;
     }
     if (inCode) { codeBuffer.push(lineRaw); continue; }
-    if (!trimmed) { flushParagraph(); closeList(); continue; }
+    if (!trimmed) { flushParagraph(); continue; }
+    const mdImg = /^!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)$/.exec(trimmed);
+    if (mdImg) {
+      flushParagraph(); closeList();
+      out.push(`<p class="rss-figure"><img src="${escapeHtml(mdImg[2])}" alt="${escapeHtml(mdImg[1])}" loading="lazy"></p>`);
+      continue;
+    }
+    if (/^\s*\|/.test(trimmed) && trimmed.indexOf("|", 1) !== -1) {
+      flushParagraph(); closeList();
+      const rows = [trimmed];
+      while (i + 1 < lines.length && /^\s*\|/.test(lines[i + 1]) && lines[i + 1].indexOf("|", 1) !== -1) {
+        i++;
+        rows.push(lines[i].trim());
+      }
+      const table = mdTableHtml(rows);
+      if (table) out.push(table);
+      else paragraph.push(trimmed);
+      continue;
+    }
     const heading = /^(#{1,4})\s+(.*)$/.exec(trimmed);
     if (heading) {
       flushParagraph(); closeList();
@@ -998,14 +1247,16 @@ function bodyToRichHtml(raw) {
       out.push(`<blockquote>${renderInline(escapeHtml(trimmed.replace(/^(&gt;|>)\s?/, "")))}</blockquote>`);
       continue;
     }
+    closeList();
     paragraph.push(trimmed);
   }
   if (inCode) out.push(`<pre><code>${escapeHtml(codeBuffer.join("\n"))}</code></pre>`);
   flushParagraph();
   closeList();
-  return { html: out.join("\n"), isHtml: false };
+  return { html: withLeadImage(out.join(""), lead), isHtml: false };
 }
 
+// src/styles.mjs
 // src/styles.mjs
 var styles = `
 .hermes-rss {height:100%;min-height:520px;display:flex;flex-direction:column;color:var(--ui-text-primary,var(--foreground));font-size:13px;font-family:inherit}
@@ -1025,10 +1276,9 @@ var styles = `
 .hermes-rss .rss-nav button{display:flex;justify-content:space-between;align-items:center;width:100%;border:0;border-radius:6px;padding:9px 10px;background:transparent;color:var(--ui-text-secondary);text-align:left;margin-bottom:3px;gap:8px}
 .hermes-rss .rss-nav button[aria-current=true]{color:var(--ui-accent);background:color-mix(in srgb,var(--ui-accent) 10%,transparent)}
 .hermes-rss .rss-nav .rss-eyebrow{padding:0 10px;margin-top:28px}.hermes-rss .rss-count{font-size:11px;font-variant-numeric:tabular-nums}
-.hermes-rss .rss-nav-heading{position:relative;display:flex;align-items:center;padding:0 10px;margin-top:28px;min-height:14px}
-.hermes-rss .rss-nav-heading .rss-eyebrow{padding:0;margin:0;letter-spacing:.8px;white-space:nowrap;margin-right:auto}
-.hermes-rss .rss-nav-heading .rss-edit-toggle{position:static;margin-left:auto;margin-top:2px}
-.hermes-rss .rss-edit-toggle{width:12px;height:12px;padding:0;margin:0;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--ui-text-tertiary)}
+.hermes-rss .rss-nav-heading{display:flex;align-items:center;padding:0 2px 0 10px;margin-top:28px;min-height:16px;width:100%;box-sizing:border-box}
+.hermes-rss .rss-nav-heading .rss-eyebrow{padding:0;margin:0;letter-spacing:.8px;white-space:nowrap;flex:1;min-width:0;line-height:1;display:flex;align-items:center}
+.hermes-rss .rss-nav .rss-edit-toggle,.hermes-rss .rss-nav-heading .rss-edit-toggle{width:16px;height:16px;padding:0;margin:0 0 0 auto;flex:0 0 16px;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--ui-text-tertiary);line-height:1}
 .hermes-rss .rss-edit-toggle .codicon{font-size:9px;line-height:1;display:block}
 .hermes-rss .rss-edit-toggle[aria-pressed=true]{color:var(--ui-accent)}
 .hermes-rss .rss-feed-row{display:flex;align-items:center;gap:2px}
@@ -1044,9 +1294,9 @@ var styles = `
 .hermes-rss .rss-list-head .rss-list-meta{display:flex;align-items:center;gap:6px;white-space:nowrap}
 .hermes-rss .rss-list-head .rss-mark-read{padding:4px 8px;font-size:11px;height:26px;min-height:0;line-height:1.2}
 .hermes-rss .rss-list-head .rss-filter-chips{margin-top:0}
-.hermes-rss .rss-detail{overflow:auto;padding:32px 44px 56px}
+.hermes-rss .rss-detail{overflow:auto;padding:0;display:flex;flex-direction:column}
 .hermes-rss .rss-detail .rss-tools{margin:18px 0}
-.hermes-rss .rss-detail-inner{max-width:70ch;margin:0 auto}
+.hermes-rss .rss-detail-inner{max-width:70ch;margin:0 auto;padding:32px 44px 56px;width:100%;box-sizing:border-box}
 .hermes-rss .rss-detail h2{font-size:24px;letter-spacing:-.3px;line-height:1.3;margin:6px 0 22px;font-weight:700}
 .hermes-rss .rss-detail .rss-eyebrow{margin-bottom:0}
 .hermes-rss .rss-detail .rss-body strong,.hermes-rss .rss-detail .rss-body b{font-weight:650}
@@ -1062,22 +1312,26 @@ var styles = `
 .hermes-rss .rss-detail .rss-body h2{font-size:1.2em;line-height:1.35}
 .hermes-rss .rss-detail .rss-body h3{font-size:1.05em;line-height:1.4}
 .hermes-rss .rss-detail .rss-body ul,.hermes-rss .rss-detail .rss-body ol{padding-left:1.4em}
-.hermes-rss .rss-detail .rss-body li{margin-bottom:.4em}
+.hermes-rss .rss-detail .rss-body li{margin:0;padding:0}
+.hermes-rss .rss-detail .rss-body li + li{margin-top:.15em}
+.hermes-rss .rss-detail .rss-body li > p{margin:0}
 .hermes-rss .rss-detail .rss-body blockquote{margin:1em 0;padding:2px 0 2px 14px;border-left:2px solid var(--ui-stroke-secondary);color:var(--ui-text-secondary);font-style:italic}
 .hermes-rss .rss-detail .rss-body a{color:var(--ui-accent);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--ui-accent) 40%,transparent)}
 .hermes-rss .rss-detail .rss-body code{font-size:.88em;background:color-mix(in srgb,var(--ui-text-secondary) 12%,transparent);border-radius:4px;padding:1px 5px}
 .hermes-rss .rss-detail .rss-body pre{background:color-mix(in srgb,var(--ui-text-secondary) 8%,transparent);border:1px solid var(--ui-stroke-secondary);border-radius:8px;padding:12px 14px;overflow:auto;white-space:pre-wrap}
 .hermes-rss .rss-detail .rss-body pre code{background:transparent;padding:0}
-.hermes-rss .rss-detail .rss-body img{max-width:100%;border-radius:8px}
+.hermes-rss .rss-detail .rss-body img{max-width:100%;height:auto;display:block;margin:1.1em 0;border-radius:8px}
 .hermes-rss .rss-detail .rss-body hr{border:0;border-top:1px solid var(--ui-stroke-secondary);margin:1.6em 0}
-.hermes-rss .rss-rich table{border-collapse:collapse;width:100%;margin:1em 0;font-size:.92em}
+.hermes-rss .rss-lead,.hermes-rss .rss-figure{margin:0 0 1.25em}.hermes-rss .rss-lead img,.hermes-rss .rss-figure img{width:100%;margin:0}.hermes-rss .rss-table-wrap{overflow-x:auto;margin:1.1em 0;width:100%}.hermes-rss .rss-rich table{border-collapse:collapse;width:100%;margin:0;font-size:.92em}
 .hermes-rss .rss-rich th,.hermes-rss .rss-rich td{border:1px solid var(--ui-stroke-secondary);padding:6px 10px;text-align:left}
 .hermes-rss .rss-rich th{background:color-mix(in srgb,var(--ui-text-secondary) 8%,transparent);font-weight:650}
 .hermes-rss .rss-rich h4{font-size:1em;margin:1.2em 0 .5em}
+.hermes-rss .rss-rich{white-space:normal}
 .hermes-rss .rss-rich .rss-list-md{white-space:normal;list-style:disc outside;padding-left:1.5em;margin:0 0 1.05em}
-.hermes-rss .rss-rich .rss-list-md li{display:list-item;margin:0 0 .35em;white-space:normal}
+.hermes-rss .rss-rich .rss-list-md li{display:list-item;margin:0;padding:0;white-space:normal}
+.hermes-rss .rss-rich .rss-list-md li + li{margin-top:.15em}
 .hermes-rss .rss-rich .rss-list-md li::before{content:none}
-.hermes-rss .rss-rich .rss-list-md p{margin:0;white-space:normal}
+.hermes-rss .rss-rich .rss-list-md p,.hermes-rss .rss-rich li > p{margin:0;white-space:normal}
 .hermes-rss .rss-rich ul.rss-ol{list-style:decimal}
 .hermes-rss .rss-rich figcaption,.hermes-rss .rss-rich small{color:var(--ui-text-secondary);font-size:.85em}
 .hermes-rss .rss-settings-header{font-size:15px;font-weight:700;letter-spacing:-.2px;margin:4px 0 2px;color:var(--ui-text-primary,var(--foreground))}
@@ -1090,9 +1344,9 @@ var styles = `
 .hermes-rss .rss-tabs-pills button{border:0;background:transparent;border-radius:0;padding:2px 0;font-size:12px;line-height:1.4;color:var(--ui-text-secondary)}
 .hermes-rss .rss-tabs-pills button[aria-selected=true]{border-bottom:2px solid var(--ui-accent);background:transparent;color:var(--ui-text-primary,var(--foreground))}
 .hermes-rss .rss-list-items{overflow:auto;flex:1;padding:8px}
-.hermes-rss .rss-card{display:block;width:100%;border:1px solid transparent;background:transparent;color:inherit;text-align:left;padding:18px 14px;border-radius:8px;margin-bottom:3px;outline:none}
-.hermes-rss .rss-card:focus:not(:focus-visible){outline:none}
-.hermes-rss .rss-card:focus-visible{outline:2px solid var(--ui-accent);outline-offset:-2px}
+.hermes-rss .rss-card{display:block;width:100%;border:1px solid transparent;background:transparent;color:inherit;text-align:left;padding:18px 14px;border-radius:8px;margin-bottom:3px;outline:none;box-shadow:none}
+.hermes-rss .rss-list-items button.rss-card:focus,.hermes-rss .rss-list-items button.rss-card:focus-visible{outline:none;box-shadow:none;outline-offset:0}
+.hermes-rss .rss-list-items button.rss-card[aria-selected=true],.hermes-rss .rss-list-items button.rss-card[aria-selected=true]:focus,.hermes-rss .rss-list-items button.rss-card[aria-selected=true]:focus-visible{outline:2px solid var(--ui-accent);outline-offset:3px}
 .hermes-rss .rss-card:hover{background:color-mix(in srgb,var(--ui-text-secondary) 5%,transparent)}
 .hermes-rss .rss-card[aria-selected=true]{background:color-mix(in srgb,var(--ui-accent) 7%,transparent);border-color:color-mix(in srgb,var(--ui-accent) 24%,transparent)}
 .hermes-rss .rss-card-read .rss-card-title{color:var(--ui-text-secondary);font-weight:500}
@@ -1110,6 +1364,7 @@ var styles = `
 .hermes-rss .rss-empty{padding:48px 24px;text-align:center;max-width:450px;margin:auto}.hermes-rss .rss-empty-mark{font-size:32px;color:var(--ui-accent);margin-bottom:20px}
 .hermes-rss .rss-empty h2{font-size:19px}.hermes-rss .rss-empty p{color:var(--ui-text-secondary);margin:10px 0 18px}
 .hermes-rss .rss-notice{margin:0;padding:10px 24px;border-bottom:1px solid var(--ui-stroke-secondary);background:color-mix(in srgb,var(--ui-accent) 6%,transparent);font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.hermes-rss .rss-notice-float{flex-shrink:0;border-radius:0;margin:0;box-shadow:none;border:0;border-bottom:1px solid var(--ui-stroke-secondary)}
 .hermes-rss .rss-notice-close{border:0;background:transparent;color:var(--ui-text-secondary);padding:2px 6px;font-size:16px;line-height:1;border-radius:4px}
 .hermes-rss .rss-notice-close:hover{background:color-mix(in srgb,var(--ui-text-secondary) 12%,transparent);color:var(--ui-text-primary,var(--foreground))}
 .hermes-rss .rss-note{padding:14px 16px;border:1px solid var(--ui-stroke-secondary);border-radius:8px;margin:18px 0;color:var(--ui-text-secondary);font-size:12px;line-height:1.7}
@@ -1131,7 +1386,7 @@ var styles = `
 .hermes-rss .rss-filter-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.hermes-rss .rss-filter-chips button{max-width:100%;white-space:normal;overflow-wrap:anywhere;text-align:left}
 @media(max-width:760px){.hermes-rss .rss-filter-panel{grid-template-columns:1fr}}
 .hermes-rss .rss-confirm{padding:16px 28px;border-bottom:1px solid var(--ui-stroke-secondary)}.hermes-rss .rss-confirm h2{font-size:16px}.hermes-rss .rss-confirm .rss-tools{margin-top:12px}
-@media(max-width:1000px){.hermes-rss .rss-layout{grid-template-columns:145px minmax(210px,.85fr) minmax(260px,1fr)}.hermes-rss .rss-detail{padding:22px 20px}.hermes-rss .rss-top{padding:20px}}
+@media(max-width:1000px){.hermes-rss .rss-layout{grid-template-columns:145px minmax(210px,.85fr) minmax(260px,1fr)}.hermes-rss .rss-detail-inner{padding:22px 20px}.hermes-rss .rss-top{padding:20px}}
 @media(max-width:760px){.hermes-rss .rss-layout{grid-template-columns:125px 1fr}.hermes-rss .rss-detail{display:none}.hermes-rss .rss-layout.has-selection .rss-list{display:none}.hermes-rss .rss-layout.has-selection .rss-detail{display:block}.hermes-rss .rss-top{align-items:flex-start}.hermes-rss .rss-top p{display:none}}
 `;
 
@@ -1317,6 +1572,7 @@ function ReaderProfile({ ctx, owner }) {
   const openArticle = (item) => {
     setSelected(item.id);
     setTab("article");
+    if (settings.fullCapture && item.url && !item.captured) captureEnqueue(owner, [{ id: item.id, url: item.url }], { front: true });
     if (!settings.markReadOnOpen || item.is_read) return;
     // Update all cached views immediately, then persist through the same library.
     client.setQueriesData({ queryKey: [...key, "articles"] }, rows =>
@@ -1332,11 +1588,11 @@ function ReaderProfile({ ctx, owner }) {
   const refreshFeeds = async () => {
     const result = await refreshSubscriptions(libraryRequest, {
       feedId,
-      shouldContinue: () => currentOwner(host) === owner,
-      captureFeedIds: readSettings(ctx, owner).fullCapture ? null : []
+      shouldContinue: () => currentOwner(host) === owner
     });
     if (!feedId) ctx.storage.set(`lastRefresh:${owner}`, Date.now());
-    setNotice(`${result.added} new articles${result.failed ? ` · ${result.failed} feeds could not refresh. Select a feed for details.` : " · Up to date."}`);
+    const queued = settings.fullCapture && result.fresh?.length ? captureEnqueue(owner, result.fresh) : 0;
+    setNotice(`${result.added} new articles${result.failed ? ` · ${result.failed} feeds could not refresh. Select a feed for details.` : " · Up to date."}${queued ? ` · Capturing ${queued} in the background.` : ""}`);
   };
   const markAllRead = () => act("Marking read…", async () => {
     const result = await libraryRequest("/articles/read-all", { method: "POST", body: { feed_id: feedId } });
@@ -1366,11 +1622,14 @@ function ReaderProfile({ ctx, owner }) {
         const item = list[next];
         if (item) {
           event.preventDefault();
+          const focused = document.activeElement;
+          if (focused && focused.classList && focused.classList.contains("rss-card")) focused.blur();
           openArticle(item);
           requestAnimationFrame(() => {
             const scroller = document.querySelector(".hermes-rss .rss-list-items");
-            const card = scroller?.querySelector(`.rss-card[aria-selected="true"]`);
+            const card = scroller?.querySelectorAll(".rss-card")[next];
             if (!scroller || !card) return;
+            card.focus({ preventScroll: true });
             const view = scroller.getBoundingClientRect();
             const box = card.getBoundingClientRect();
             const cardTop = box.top - view.top;
@@ -1445,6 +1704,10 @@ function ReaderProfile({ ctx, owner }) {
     ctx.storage.set(`settings:${owner}`, next);
     setSettings(next);
     setDraft(next);
+    if (next.fullCapture) {
+      const backlog = (articles.data || []).filter((a) => a.url && !a.captured).slice(0, 40).map((a) => ({ id: a.id, url: a.url }));
+      captureEnqueue(owner, backlog);
+    }
     publishLibraryChange(owner);
     setNotice("Reader settings saved.");
     setSettingsOpen(false);
@@ -1558,10 +1821,6 @@ function ReaderProfile({ ctx, owner }) {
         /* @__PURE__ */ jsx(Button, { onClick: () => setAdding(!adding), disabled, children: "+ Subscribe" })
       ] })
     ] }),
-    (busy || notice) && jsxs("div", { className: "rss-notice", role: "status", children: [
-      jsx("span", { children: busy || notice }),
-      notice && jsx("button", { type: "button", className: "rss-notice-close", "aria-label": "Dismiss notification", onClick: () => setNotice(""), children: "×" })
-    ] }),
     filtersOpen && jsxs("div", { className: "rss-filter-panel", "aria-label": "Filters and saved searches", children: [
       jsxs("div", { className: "rss-filter-column", children: [
         jsx("h2", { children: "Current search" }),
@@ -1620,10 +1879,10 @@ function ReaderProfile({ ctx, owner }) {
         jsxs("div", { className: "rss-setting-row", children: [
           jsx("label", { className: "rss-setting", children: [
             jsx("input", { type: "checkbox", checked: draft.fullCapture, onChange: event => setDraft({ ...draft, fullCapture: event.target.checked }) }),
-            "Capture full articles on refresh"
+            "Capture full articles in the background"
           ] }),
         ] }),
-        jsx("p", { className: "rss-muted rss-small", children: "When on, every new article is fetched from its website and the feed excerpt is replaced with the full text (up to 10 per refresh). Paywalled and script-only pages keep the excerpt. You can always load the full text of the open article from its action row." }),
+        jsx("p", { className: "rss-muted rss-small", children: "When on, new articles are queued after refresh and captured two at a time in the background. Full text is kept in this library until the article drops out of the list, so a Hermes restart does not recapture it. Opening an article jumps it to the front of the queue. Paywalled and script-only pages keep the excerpt." }),
         jsx("div", { className: "rss-tools", children: [jsx(Button, { type: "submit", children: "Save settings" }), jsx(Button, { type: "button", variant: "ghost", onClick: () => setSettingsOpen(false), children: "Cancel" })] })
       ] }),
       jsxs("div", { className: "rss-settings-library", "aria-label": "Library", children: [
@@ -1830,7 +2089,12 @@ function ReaderProfile({ ctx, owner }) {
           articles.data?.length === limit && limit < 500 && /* @__PURE__ */ jsx(Button, { variant: "ghost", onClick: () => setLimit(limit + 100), children: "Load more" })
         ] })
       ] }),
-      /* @__PURE__ */ jsx("main", { className: "rss-detail", children:
+      /* @__PURE__ */ jsxs("main", { className: "rss-detail", children: [
+        (busy || notice) && jsxs("div", { className: "rss-notice rss-notice-float", role: "status", children: [
+          jsx("span", { children: busy || notice }),
+          notice && jsx("button", { type: "button", className: "rss-notice-close", "aria-label": "Dismiss notification", onClick: () => setNotice(""), children: "×" })
+        ] }),
+        /* @__PURE__ */ jsx(Fragment, { children:
         !selected ? /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsxs(Empty, { title: "Follow your curiosity", children: [
           /* @__PURE__ */ jsx("p", { children: "Pick an article to read, unpack its ideas with Hermes, or look for evidence beyond the headline." }),
           /* @__PURE__ */ jsx("div", { className: "rss-note", children: "AI runs only when you ask. Feed refresh uses standard network utilities on the connected gateway. Selected text goes to your configured model. Source checks use your Hermes web tools." })
@@ -1985,10 +2249,10 @@ function ReaderProfile({ ctx, owner }) {
           }
         ),
         tab === "article" && (() => {
-          const rich = bodyToRichHtml(article.body || "");
+          const rich = bodyToRichHtml(article.body || "", article.image);
           return /* @__PURE__ */ jsxs("div", { role: "tabpanel", children: [
             rich.html ? /* @__PURE__ */ jsx("div", { className: "rss-body rss-rich", dangerouslySetInnerHTML: { __html: rich.html } }) : /* @__PURE__ */ jsx("p", { className: "rss-body", children: "This feed contains only a headline. Open the original article to read more." }),
-            /* @__PURE__ */ jsx("div", { className: "rss-note", children: rich.isHtml ? "Rendered from the feed's own HTML. Scripts are stripped and only https links and images survive sanitizing." : "This is the text supplied by the feed. It may be an excerpt. Embedded scripts and remote images are not loaded." })
+            /* @__PURE__ */ jsx("div", { className: "rss-note", children: rich.isHtml ? "Rendered from the feed's own HTML. Scripts are stripped and only https links and images survive sanitizing." : "This is the text supplied by the feed. It may be an excerpt. Scripts are stripped; https images and tables are kept." })
           ] });
         })(),
         tab === "summary" && /* @__PURE__ */ jsxs("div", { role: "tabpanel", children: [
@@ -2084,7 +2348,9 @@ function ReaderProfile({ ctx, owner }) {
             }
           )
         ] }) })
-      ] }) }) })
+      ] }) })
+        })
+      ] })
     ] })
   ] });
 }
@@ -2096,6 +2362,7 @@ var plugin_default = {
   defaultEnabled: true,
   register(ctx) {
     if (typeof ctx.onDispose === "function") ctx.onDispose(startAutoRefresh(ctx, host));
+    ctx.onDispose ? ctx.onDispose(startCaptureWorker(ctx, host)) : startCaptureWorker(ctx, host);
     ctx.register({
       id: "page",
       area: ROUTES_AREA,
