@@ -349,6 +349,13 @@ function createLibrary(owner, fetchFeed2, transaction = transact) {
             (a) => a.feed_id !== parts[1] || a.is_saved
           );
         });
+      if (parts[2] === "reorder" && method === "POST")
+        return write((library) => {
+          const order = Array.isArray(body.order) ? body.order : [];
+          if (order.length !== library.feeds.length || !order.every(id => typeof id === "string" && library.feeds.some(f => f.id === id)))
+            throw new Error("Order does not match the subscriptions.");
+          library.feeds.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+        });
       if (parts[2] === "refresh") {
         const key = JSON.stringify([owner, parts[1]]);
         if (feedRefreshes.has(key)) return feedRefreshes.get(key);
@@ -760,8 +767,11 @@ var styles = `
 .hermes-rss *{box-sizing:border-box}.hermes-rss button,.hermes-rss input{font:inherit}
 .hermes-rss button{cursor:pointer}.hermes-rss button:disabled{opacity:.5;cursor:wait}
 .hermes-rss button:focus-visible,.hermes-rss input:focus-visible{outline:2px solid var(--ui-accent);outline-offset:3px}
-.hermes-rss .rss-top{display:flex;justify-content:space-between;align-items:center;padding:24px 28px 20px;border-bottom:1px solid var(--ui-stroke-secondary);gap:16px}
+.hermes-rss .rss-top{display:flex;justify-content:space-between;align-items:center;padding:10px 20px;border-bottom:1px solid var(--ui-stroke-secondary);gap:12px}
 .hermes-rss h1{font-size:24px;letter-spacing:-.8px;font-weight:650;margin:0 0 5px}.hermes-rss h2{font-size:20px;letter-spacing:-.4px;line-height:1.4;margin:0 0 12px}
+.hermes-rss .rss-top h1{font-size:15px;letter-spacing:-.2px;margin:0;line-height:1.3}
+.hermes-rss .rss-top .rss-tools{gap:6px}
+.hermes-rss .rss-top .rss-tools button{padding:4px 10px;font-size:12px;height:26px;min-height:0;line-height:1.2}
 .hermes-rss p{margin:0;line-height:1.7}.hermes-rss .rss-muted{color:var(--ui-text-secondary)}
 .hermes-rss .rss-eyebrow{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-weight:650;color:var(--ui-text-tertiary);margin-bottom:10px}
 .hermes-rss .rss-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -770,9 +780,50 @@ var styles = `
 .hermes-rss .rss-nav button{display:flex;justify-content:space-between;align-items:center;width:100%;border:0;border-radius:6px;padding:9px 10px;background:transparent;color:var(--ui-text-secondary);text-align:left;margin-bottom:3px;gap:8px}
 .hermes-rss .rss-nav button[aria-current=true]{color:var(--ui-accent);background:color-mix(in srgb,var(--ui-accent) 10%,transparent)}
 .hermes-rss .rss-nav .rss-eyebrow{padding:0 10px;margin-top:28px}.hermes-rss .rss-count{font-size:11px;font-variant-numeric:tabular-nums}
+.hermes-rss .rss-nav-heading{display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:0 8px;margin-top:28px;min-width:0}
+.hermes-rss .rss-nav-heading .rss-eyebrow{padding:0;margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;letter-spacing:.8px}
+.hermes-rss .rss-edit-toggle{width:12px;height:12px;padding:0;margin:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--ui-text-tertiary)}
+.hermes-rss .rss-edit-toggle .codicon{font-size:9px;line-height:1;display:block}
+.hermes-rss .rss-edit-toggle[aria-pressed=true]{color:var(--ui-accent)}
+.hermes-rss .rss-feed-row{display:flex;align-items:center;gap:2px}
+.hermes-rss .rss-feed-row-editing{border-radius:6px}
+.hermes-rss .rss-feed-row-dragging{opacity:.45}
+.hermes-rss .rss-feed-edit{display:flex;align-items:center;flex-shrink:0}
+.hermes-rss .rss-feed-edit button{width:18px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--ui-text-tertiary);font-size:12px}
+.hermes-rss .rss-grip{cursor:grab}
 .hermes-rss .rss-feed-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hermes-rss .rss-list{border-right:1px solid var(--ui-stroke-secondary);display:flex;flex-direction:column;min-height:0}
-.hermes-rss .rss-list-head{padding:18px 18px 14px;border-bottom:1px solid var(--ui-stroke-secondary)}
+.hermes-rss .rss-list-head{padding:10px 12px;border-bottom:1px solid var(--ui-stroke-secondary);display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.hermes-rss .rss-list-head input{flex:1;min-width:120px;height:26px;padding:4px 8px;font-size:12px}
+.hermes-rss .rss-list-head .rss-list-meta{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.hermes-rss .rss-list-head .rss-mark-read{padding:4px 8px;font-size:11px;height:26px;min-height:0;line-height:1.2}
+.hermes-rss .rss-list-head .rss-filter-chips{margin-top:0}
+.hermes-rss .rss-detail{overflow:auto;padding:32px 44px 56px}
+.hermes-rss .rss-detail-inner{max-width:70ch;margin:0 auto}
+.hermes-rss .rss-detail h2{font-size:26px;letter-spacing:-.4px;line-height:1.25;margin:6px 0 14px;font-weight:700}
+.hermes-rss .rss-detail .rss-eyebrow{margin-bottom:0}
+.hermes-rss .rss-article-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0;margin:18px 0 0}
+.hermes-rss .rss-icon-row{display:inline-flex;align-items:center;gap:2px}
+.hermes-rss .rss-icon-btn{width:24px;height:24px;padding:0;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:5px;background:transparent;color:var(--ui-text-secondary);font-size:14px}
+.hermes-rss .rss-icon-btn:hover:not(:disabled){color:var(--foreground);background:var(--chrome-action-hover)}
+.hermes-rss .rss-icon-btn:disabled{opacity:.4;cursor:default}
+.hermes-rss .rss-body{white-space:pre-wrap;font-family:Georgia,'Iowan Old Style','Times New Roman',serif;font-size:16.5px;line-height:1.7;overflow-wrap:break-word;color:var(--ui-text-primary,var(--foreground));margin:22px 0 0}
+.hermes-rss .rss-detail .rss-body p,.hermes-rss .rss-detail .rss-body h1,.hermes-rss .rss-detail .rss-body h2,.hermes-rss .rss-detail .rss-body h3,.hermes-rss .rss-detail .rss-body ul,.hermes-rss .rss-detail .rss-body ol,.hermes-rss .rss-detail .rss-body blockquote{margin:0 0 1.05em}
+.hermes-rss .rss-detail .rss-body h1{font-size:1.35em;line-height:1.3}
+.hermes-rss .rss-detail .rss-body h2{font-size:1.2em;line-height:1.35}
+.hermes-rss .rss-detail .rss-body h3{font-size:1.05em;line-height:1.4}
+.hermes-rss .rss-detail .rss-body ul,.hermes-rss .rss-detail .rss-body ol{padding-left:1.4em}
+.hermes-rss .rss-detail .rss-body li{margin-bottom:.4em}
+.hermes-rss .rss-detail .rss-body blockquote{margin:1em 0;padding:2px 0 2px 14px;border-left:2px solid var(--ui-stroke-secondary);color:var(--ui-text-secondary);font-style:italic}
+.hermes-rss .rss-detail .rss-body a{color:var(--ui-accent);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--ui-accent) 40%,transparent)}
+.hermes-rss .rss-detail .rss-body code{font-size:.88em;background:color-mix(in srgb,var(--ui-text-secondary) 12%,transparent);border-radius:4px;padding:1px 5px}
+.hermes-rss .rss-detail .rss-body pre{background:color-mix(in srgb,var(--ui-text-secondary) 8%,transparent);border:1px solid var(--ui-stroke-secondary);border-radius:8px;padding:12px 14px;overflow:auto;white-space:pre-wrap}
+.hermes-rss .rss-detail .rss-body pre code{background:transparent;padding:0}
+.hermes-rss .rss-detail .rss-body img{max-width:100%;border-radius:8px}
+.hermes-rss .rss-detail .rss-body hr{border:0;border-top:1px solid var(--ui-stroke-secondary);margin:1.6em 0}
+.hermes-rss .rss-tabs-pills{display:inline-flex;gap:14px;margin:0;border:0;padding:0;justify-self:center}
+.hermes-rss .rss-tabs-pills button{border:0;background:transparent;border-radius:0;padding:2px 0;font-size:12px;line-height:1.4;color:var(--ui-text-secondary)}
+.hermes-rss .rss-tabs-pills button[aria-selected=true]{border-bottom:2px solid var(--ui-accent);background:transparent;color:var(--ui-text-primary,var(--foreground))}
 .hermes-rss .rss-list-items{overflow:auto;flex:1;padding:8px}
 .hermes-rss .rss-card{display:block;width:100%;border:1px solid transparent;background:transparent;color:inherit;text-align:left;padding:18px 14px;border-radius:8px;margin-bottom:3px}
 .hermes-rss .rss-card:hover{background:color-mix(in srgb,var(--ui-text-secondary) 5%,transparent)}
@@ -803,8 +854,10 @@ var styles = `
 .hermes-rss .rss-feed-header-error{margin-top:8px;color:var(--ui-danger,var(--ui-text-secondary))}
 .hermes-rss .rss-settings{padding:18px 28px;border-bottom:1px solid var(--ui-stroke-secondary);display:grid;gap:16px}.hermes-rss .rss-settings h2{font-size:16px;margin:0}.hermes-rss .rss-setting{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.hermes-rss .rss-setting input[type=number]{width:90px}.hermes-rss .rss-setting input[type=checkbox]{accent-color:var(--ui-accent)}
 .hermes-rss .rss-settings-library{display:grid;gap:12px;padding-top:14px;border-top:1px solid var(--ui-stroke-secondary)}
-.hermes-rss .rss-filter-panel{display:grid;grid-template-columns:1fr 1fr;gap:20px;padding:18px 28px;border-bottom:1px solid var(--ui-stroke-secondary);max-height:45vh;overflow:auto;flex-shrink:0}
-.hermes-rss .rss-filter-column{display:grid;align-content:start;gap:10px;min-width:0}.hermes-rss .rss-filter-column h2{font-size:16px;margin:0}.hermes-rss .rss-filter-column input{min-width:0;max-width:100%}
+.hermes-rss .rss-filter-panel{display:grid;grid-template-columns:1fr 1fr;gap:14px 24px;padding:12px 20px;border-bottom:1px solid var(--ui-stroke-secondary);max-height:45vh;overflow:auto;flex-shrink:0}
+.hermes-rss .rss-filter-column{display:grid;align-content:start;gap:8px;min-width:0}.hermes-rss .rss-filter-column h2{font-size:12px;letter-spacing:.4px;text-transform:uppercase;color:var(--ui-text-tertiary);margin:0}.hermes-rss .rss-filter-column input,.hermes-rss .rss-filter-column select{min-width:0;max-width:100%;padding:4px 8px;font-size:12px;height:26px}
+.hermes-rss .rss-filter-panel button{padding:4px 10px;font-size:12px;height:26px;min-height:0;line-height:1.2}
+.hermes-rss .rss-filter-panel .rss-small{line-height:1.45}
 .hermes-rss select{font:inherit;color:inherit;background:var(--ui-bg-primary,var(--background));border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:7px;max-width:100%}
 .hermes-rss .rss-filter-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.hermes-rss .rss-filter-chips button{max-width:100%;white-space:normal;overflow-wrap:anywhere;text-align:left}
 @media(max-width:760px){.hermes-rss .rss-filter-panel{grid-template-columns:1fr}}
@@ -815,7 +868,7 @@ var styles = `
 
 // src/plugin.jsx
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var ID = "hermes-rss";
+var ID = "hermes-rss-reader";
 var labels = {
   supported: "Supported by retrieved evidence",
   conflicting: "Conflicting evidence",
@@ -897,6 +950,11 @@ function ReaderProfile({ ctx, owner }) {
   const [settings, setSettings] = useState(() => readSettings(ctx, owner));
   const [draft, setDraft] = useState(() => readSettings(ctx, owner));
   const [feedToRemove, setFeedToRemove] = useState(null);
+  const [reorderMode, setReorderMode] = useState(false);
+  const [dragOrder, setDragOrder] = useState(null);
+  const [draggingId, setDraggingId] = useState(null);
+  const dragOrderRef = useRef(null);
+  const dragFeedId = useRef(null);
   const confirmation = useRef(null);
   useEffect(() => { if (feedToRemove) confirmation.current?.focus(); }, [feedToRemove]);
   useEffect(() => {
@@ -1013,6 +1071,33 @@ function ReaderProfile({ ctx, owner }) {
     const result = await libraryRequest("/articles/read-all", { method: "POST", body: { feed_id: feedId } });
     setNotice(`${result.count} article${result.count === 1 ? "" : "s"} marked as read.`);
   });
+  const articleList = articles.data || [];
+  const selectedIndex = selected ? articleList.findIndex(a => a.id === selected) : -1;
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) return;
+      const list = articleList;
+      if (!list.length) return;
+      if (event.key === "j" || event.key === "k") {
+        const step = event.key === "j" ? 1 : -1;
+        let next = selectedIndex < 0 ? (step > 0 ? 0 : list.length - 1) : Math.min(list.length - 1, Math.max(0, selectedIndex + step));
+        const item = list[next];
+        if (item) { event.preventDefault(); openArticle(item); }
+      } else if (event.key === "s" && article) {
+        event.preventDefault();
+        act("Saving…", () => libraryRequest(`/articles/${article.id}`, {
+          method: "PATCH", body: { is_saved: !article.is_saved }
+        }));
+      } else if (event.key === "d" && article && !disabled) {
+        event.preventDefault();
+        start("discuss");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
   const unsubscribe = () => act("Unsubscribing…", async () => {
     const removed = feedToRemove;
     await libraryRequest(`/feeds/${removed.id}`, { method: "DELETE" });
@@ -1021,6 +1106,38 @@ function ReaderProfile({ ctx, owner }) {
     setFeedToRemove(null);
     setNotice(`Unsubscribed from ${removed.title}. Saved articles and chats were kept.`);
   });
+  const displayedFeeds = (feeds.data || []).map(feed => ({
+    feed,
+    index: dragOrder ? dragOrder.indexOf(feed.id) : (feeds.data || []).indexOf(feed)
+  })).sort((a, b) => a.index - b.index).map(entry => entry.feed);
+  const handleDragStart = feed => event => {
+    dragFeedId.current = feed.id;
+    setDraggingId(feed.id);
+    dragOrderRef.current = displayedFeeds.map(f => f.id);
+    event.dataTransfer.effectAllowed = "move";
+    try { event.dataTransfer.setData("text/plain", feed.id); } catch {}
+  };
+  const handleDragOver = () => event => {
+    if (!dragFeedId.current) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+  };
+  const handleDrop = feed => event => {
+    event.preventDefault();
+    const dragged = dragFeedId.current;
+    if (!dragged || dragged === feed.id) { setDraggingId(null); dragFeedId.current = null; setDragOrder(null); dragOrderRef.current = null; return; }
+    const order = (dragOrderRef.current || displayedFeeds.map(f => f.id)).filter(id => id !== dragged);
+    order.splice(displayedFeeds.findIndex(f => f.id === feed.id), 0, dragged);
+    setDragOrder(order);
+    setDraggingId(null);
+    dragFeedId.current = null;
+    dragOrderRef.current = null;
+    act("Reordering\u2026", async () => {
+      await libraryRequest("/feeds/reorder", { method: "POST", body: { order } });
+      refresh();
+      setDragOrder(null);
+    });
+  };
   const saveSettings = event => {
     event.preventDefault();
     const minutes = Number(draft.refreshMinutes);
@@ -1126,11 +1243,9 @@ function ReaderProfile({ ctx, owner }) {
   return /* @__PURE__ */ jsxs("section", { className: "hermes-rss", "aria-label": "RSS reader", children: [
     /* @__PURE__ */ jsx("style", { children: styles }),
     /* @__PURE__ */ jsxs("header", { className: "rss-top", children: [
-      /* @__PURE__ */ jsxs("div", { children: [
-        /* @__PURE__ */ jsx("div", { className: "rss-eyebrow", children: "Your sources. Your perspective." }),
-        /* @__PURE__ */ jsx("h1", { children: "RSS" }),
-        /* @__PURE__ */ jsx("p", { className: "rss-muted", children: "A little less noise. A little more understanding." })
-      ] }),
+      /* @__PURE__ */ jsx("div", { children:
+        /* @__PURE__ */ jsx("h1", { children: "RSS" })
+      }),
       /* @__PURE__ */ jsxs("div", { className: "rss-tools", children: [
         /* @__PURE__ */ jsx(
           Button,
@@ -1295,8 +1410,21 @@ function ReaderProfile({ ctx, owner }) {
         )),
         searches.length > 0 && jsx("div", { className: "rss-eyebrow", children: "Saved searches" }),
         searches.map(search => jsx("button", { onClick: () => openSearch(search), title: search.name, children: jsx("span", { className: "rss-feed-name", children: search.name }) }, search.id)),
-        /* @__PURE__ */ jsx("div", { className: "rss-eyebrow", children: "Subscriptions" }),
-        (feeds.data || []).map(feed => jsxs("div", { className: "rss-feed-row", children: [
+        /* @__PURE__ */ jsxs("div", { className: "rss-nav-heading", children: [
+          /* @__PURE__ */ jsx("div", { className: "rss-eyebrow", children: "Subscriptions" }),
+          jsx("button", { className: "rss-edit-toggle", "aria-pressed": reorderMode, "aria-label": reorderMode ? "Exit edit mode" : "Edit subscriptions", title: reorderMode ? "Exit edit mode" : "Edit subscriptions", onClick: () => setReorderMode(!reorderMode), children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-pencil", "aria-hidden": "true" }) })
+        ] }),
+        (displayedFeeds || []).map((feed) => jsxs("div", {
+          className: `rss-feed-row${reorderMode ? " rss-feed-row-editing" : ""}${draggingId === feed.id ? " rss-feed-row-dragging" : ""}`,
+          draggable: reorderMode,
+          onDragStart: reorderMode ? handleDragStart(feed) : undefined,
+          onDragOver: reorderMode && draggingId ? handleDragOver() : undefined,
+          onDrop: reorderMode && draggingId ? handleDrop(feed) : undefined,
+          onDragEnd: () => { setDraggingId(null); dragFeedId.current = null; },
+          children: [
+          reorderMode && jsx("span", { className: "rss-feed-edit", children:
+            jsx("button", { className: "rss-grip", disabled: true, "aria-hidden": "true", tabIndex: -1, title: "Drag to reorder", children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-gripper", "aria-hidden": "true" }) })
+          }),
           jsxs("button", { className: "rss-feed-open", "aria-current": feedId === feed.id,
             title: `${feed.folder ? feed.folder + " / " : ""}${feed.title}`,
             onClick: () => selectView("all", feed.id), children: [
@@ -1306,7 +1434,7 @@ function ReaderProfile({ ctx, owner }) {
               ] }),
               jsx("span", { className: "rss-count", children: feed.unread || "" })
             ] }),
-          jsx("button", { className: "rss-unsubscribe", disabled, title: "Unsubscribe", "aria-label": `Unsubscribe from ${feed.title}`, onClick: () => setFeedToRemove(feed), children: "×" })
+          reorderMode && jsx("button", { className: "rss-unsubscribe rss-unsubscribe-edit", disabled, title: "Unsubscribe", "aria-label": `Unsubscribe from ${feed.title}`, onClick: () => setFeedToRemove(feed), children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-trash", "aria-hidden": "true" }) })
         ] }, feed.id)),
         !feeds.data?.length && /* @__PURE__ */ jsx("p", { className: "rss-muted rss-small", style: { padding: "0 10px" }, children: "Your feeds will appear here." })
       ] }),
@@ -1325,7 +1453,10 @@ function ReaderProfile({ ctx, owner }) {
               }
             }
           ),
-          jsxs("div", { className: "rss-filter-chips", "aria-label": "Active filters", children: [
+          /* @__PURE__ */ jsx("span", { className: "rss-list-meta", children:
+            /* @__PURE__ */ jsx("button", { type: "button", className: "rss-mark-read", disabled, onClick: markAllRead, "aria-label": feedId ? "Mark feed as read" : "Mark all as read", title: (feedId ? "Mark feed as read" : "Mark all as read") + " \u00b7 includes hidden articles and articles outside the current search.", children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-check-all", "aria-hidden": "true" }) })
+          }),
+          (query || exclude || feedId || view !== "all" || mutes.length > 0 || showHidden) && jsxs("div", { className: "rss-filter-chips", "aria-label": "Active filters", children: [
             query && jsx(Button, { size: "sm", variant: "outline", "aria-label": "Clear search phrase", onClick: () => { setQuery(""); setLimit(100); }, children: `Search: ${query} ×` }),
             exclude && jsx(Button, { size: "sm", variant: "outline", "aria-label": "Clear excluded phrase", onClick: () => { setExclude(""); setLimit(100); }, children: `Exclude: ${exclude} ×` }),
             feedId && jsx(Button, { size: "sm", variant: "outline", "aria-label": "Clear feed filter", onClick: () => selectView(view), children: `${chosenFeed?.title || "Removed feed"} ×` }),
@@ -1336,13 +1467,6 @@ function ReaderProfile({ ctx, owner }) {
             ] }),
             (query || exclude || feedId || view !== "all" || showHidden) && jsx(Button, { size: "sm", variant: "ghost", onClick: resetFilters, children: "Reset filters" })
           ] }),
-          /* @__PURE__ */ jsxs("p", { className: "rss-muted rss-small", style: { marginTop: 10 }, children: [
-            chosenFeed?.title || (view === "saved" ? "Saved for later" : view === "unread" ? "Unread articles" : "All articles"),
-            " ",
-            "\xB7 ",
-            articles.data?.length || 0
-          ] }),
-          jsx(Button, { variant: "ghost", size: "sm", disabled: disabled || !(feeds.data || []).some(f => (!feedId || f.id === feedId) && f.unread > 0) && !articles.data?.some(a => !a.is_read), onClick: markAllRead, title: "Includes hidden articles and articles outside the current search.", children: feedId ? "Mark feed as read" : "Mark all as read" }),
           chosenFeed?.error && /* @__PURE__ */ jsx("p", { role: "status", className: "rss-small rss-feed-header-error", children: chosenFeed.error })
         ] }),
         /* @__PURE__ */ jsxs("div", { className: "rss-list-items", children: [
@@ -1391,102 +1515,134 @@ function ReaderProfile({ ctx, owner }) {
           articles.data?.length === limit && limit < 500 && /* @__PURE__ */ jsx(Button, { variant: "ghost", onClick: () => setLimit(limit + 100), children: "Load more" })
         ] })
       ] }),
-      /* @__PURE__ */ jsx("main", { className: "rss-detail", children: !selected ? /* @__PURE__ */ jsxs(Empty, { title: "Follow your curiosity", children: [
-        /* @__PURE__ */ jsx("p", { children: "Pick an article to read, unpack its ideas with Hermes, or look for evidence beyond the headline." }),
-        /* @__PURE__ */ jsx("div", { className: "rss-note", children: "AI runs only when you ask. Feed refresh uses standard network utilities on the connected gateway. Selected text goes to your configured model. Source checks use your Hermes web tools." })
-      ] }) : detail.isPending ? /* @__PURE__ */ jsx(Empty, { title: "Opening article\u2026" }) : detail.error ? /* @__PURE__ */ jsxs(Empty, { title: "Article unavailable", children: [
-        /* @__PURE__ */ jsx("p", { children: "It may have been removed." }),
-        /* @__PURE__ */ jsx(Button, { onClick: () => setSelected(null), children: "Back to articles" })
-      ] }) : article && /* @__PURE__ */ jsxs(Fragment, { children: [
-        /* @__PURE__ */ jsx(
-          Button,
-          {
-            variant: "ghost",
-            size: "sm",
-            onClick: () => setSelected(null),
-            children: "\u2190 Articles"
-          }
-        ),
-        /* @__PURE__ */ jsxs("div", { className: "rss-eyebrow", style: { marginTop: 24 }, children: [
+      /* @__PURE__ */ jsx("main", { className: "rss-detail", children:
+        !selected ? /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsxs(Empty, { title: "Follow your curiosity", children: [
+          /* @__PURE__ */ jsx("p", { children: "Pick an article to read, unpack its ideas with Hermes, or look for evidence beyond the headline." }),
+          /* @__PURE__ */ jsx("div", { className: "rss-note", children: "AI runs only when you ask. Feed refresh uses standard network utilities on the connected gateway. Selected text goes to your configured model. Source checks use your Hermes web tools." })
+        ] }) }) :
+        detail.isPending ? /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsx(Empty, { title: "Opening article\u2026" }) }) :
+        detail.error ? /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsxs(Empty, { title: "Article unavailable", children: [
+          /* @__PURE__ */ jsx("p", { children: "It may have been removed." }),
+          /* @__PURE__ */ jsx(Button, { onClick: () => setSelected(null), children: "Back to articles" })
+        ] }) }) :
+        article && /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsxs(Fragment, { children: [
+        /* @__PURE__ */ jsxs("div", { className: "rss-eyebrow", style: { marginTop: 8 }, children: [
           article.feed_title,
           " \xB7 ",
           date(article.published_at)
         ] }),
-        /* @__PURE__ */ jsx("h2", { children: article.title }),
-        /* @__PURE__ */ jsxs("div", { className: "rss-tools", children: [
-          /* @__PURE__ */ jsx("span", { className: "rss-chip", children: "Feed excerpt" }),
+        /* @__PURE__ */ jsx("h2", { role: article.url ? "link" : undefined, style: article.url ? { cursor: "pointer" } : undefined, title: article.url ? "Open original" : undefined, onClick: article.url ? () => act("Opening\u2026", async () => {
+          if (!await ctx.os.openExternal(article.url))
+            throw new Error(
+              "Could not open the original article."
+            );
+        }) : undefined, children: article.title }),
+        /* @__PURE__ */ jsxs("div", { className: "rss-tools rss-article-actions", children: [
+          /* @__PURE__ */ jsxs("div", { className: "rss-icon-row", children: [
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled: !article.url,
+                "aria-label": "Open original",
+                title: "Open original",
+                onClick: () => act("Opening\u2026", async () => {
+                  if (!await ctx.os.openExternal(article.url))
+                    throw new Error(
+                      "Could not open the original article."
+                    );
+                }),
+                children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-link-external", "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled: disabled || !article.url,
+                "aria-label": "Copy link",
+                title: "Copy link",
+                onClick: () => act("Copying\u2026", async () => {
+                  await navigator.clipboard.writeText(article.url);
+                  setNotice("Article link copied.");
+                }),
+                children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-copy", "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled,
+                "aria-label": article.is_saved ? "Saved" : "Save",
+                title: article.is_saved ? "Saved" : "Save",
+                onClick: () => act(
+                  "Saving\u2026",
+                  () => libraryRequest(`/articles/${article.id}`, {
+                    method: "PATCH",
+                    body: { is_saved: !article.is_saved }
+                  })
+                ),
+                children: /* @__PURE__ */ jsx("i", { className: `codicon ${article.is_saved ? "codicon-save" : "codicon-save-as"}`, "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled,
+                "aria-label": article.is_read ? "Mark unread" : "Mark read",
+                title: article.is_read ? "Mark unread" : "Mark read",
+                onClick: () => act(
+                  "Updating\u2026",
+                  () => libraryRequest(`/articles/${article.id}`, {
+                    method: "PATCH",
+                    body: { is_read: !article.is_read }
+                  })
+                ),
+                children: /* @__PURE__ */ jsx("i", { className: `codicon ${article.is_read ? "codicon-eye-closed" : "codicon-mail-read"}`, "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled,
+                "aria-label": "Check sources",
+                title: "Check sources",
+                onClick: () => start("check"),
+                children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-shield", "aria-hidden": "true" })
+              }
+            )
+          ] }),
           /* @__PURE__ */ jsx(
-            Button,
+            "div",
             {
-              size: "sm",
-              variant: "ghost",
-              disabled: !article.url,
-              onClick: () => act("Opening\u2026", async () => {
-                if (!await ctx.os.openExternal(article.url))
-                  throw new Error(
-                    "Could not open the original article."
-                  );
-              }),
-              children: "Open original \u2197"
+              className: "rss-tabs rss-tabs-pills",
+              role: "tablist",
+              "aria-label": "Article content",
+              children: [
+                ["article", "Article"],
+                ["summary", "Summary"],
+                ["evidence", "Evidence"]
+              ].map(([id, label]) => /* @__PURE__ */ jsx(
+                "button",
+                {
+                  role: "tab",
+                  "aria-selected": tab === id,
+                  onClick: () => setTab(id),
+                  children: label
+                },
+                id
+              ))
             }
           ),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              size: "sm",
-              variant: "ghost",
-              disabled: disabled || !article.url,
-              onClick: () => act("Copying\u2026", async () => {
-                await navigator.clipboard.writeText(article.url);
-                setNotice("Article link copied.");
-              }),
-              children: "Copy link"
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              size: "sm",
-              variant: "ghost",
-              disabled,
-              onClick: () => act(
-                "Saving\u2026",
-                () => libraryRequest(`/articles/${article.id}`, {
-                  method: "PATCH",
-                  body: { is_saved: !article.is_saved }
-                })
-              ),
-              children: article.is_saved ? "\u2605 Saved" : "\u2606 Save"
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              size: "sm",
-              variant: "ghost",
-              disabled,
-              onClick: () => act(
-                "Updating\u2026",
-                () => libraryRequest(`/articles/${article.id}`, {
-                  method: "PATCH",
-                  body: { is_read: !article.is_read }
-                })
-              ),
-              children: article.is_read ? "Mark unread" : "Mark read"
-            }
-          )
-        ] }),
-        /* @__PURE__ */ jsxs("div", { className: "rss-tools", children: [
-          /* @__PURE__ */ jsx(Button, { disabled, onClick: () => start("discuss"), children: "Discuss with Hermes \u2197" }),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              variant: "outline",
-              disabled,
-              onClick: () => start("check"),
-              children: "Check sources"
-            }
-          )
+          /* @__PURE__ */ jsx(Button, { disabled, onClick: () => start("discuss"), children: "Discuss \u2197" })
         ] }),
         latestChat && /* @__PURE__ */ jsx(
           Button,
@@ -1499,28 +1655,6 @@ function ReaderProfile({ ctx, owner }) {
               () => continueConversation(host, latestChat)
             ),
             children: "Continue last conversation \u2197"
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "rss-tabs",
-            role: "tablist",
-            "aria-label": "Article content",
-            children: [
-              ["article", "Article"],
-              ["summary", "Summary"],
-              ["evidence", "Evidence"]
-            ].map(([id, label]) => /* @__PURE__ */ jsx(
-              "button",
-              {
-                role: "tab",
-                "aria-selected": tab === id,
-                onClick: () => setTab(id),
-                children: label
-              },
-              id
-            ))
           }
         ),
         tab === "article" && /* @__PURE__ */ jsxs("div", { role: "tabpanel", children: [
@@ -1620,14 +1754,13 @@ function ReaderProfile({ ctx, owner }) {
             }
           )
         ] }) })
-      ] }) })
-    ] }),
-
+      ] }) }) })
+    ] })
   ] });
 }
 var plugin_default = {
   id: ID,
-  name: "RSS",
+  name: "RSS Reader",
   defaultEnabled: true,
   register(ctx) {
     if (typeof ctx.onDispose === "function") ctx.onDispose(startAutoRefresh(ctx, host));
