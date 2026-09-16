@@ -162,7 +162,7 @@ function validateSummary(text, body) {
 }
 
 // src/library.mjs
-var EMPTY = () => ({ feeds: [], articles: [] });
+var EMPTY = () => ({ feeds: [], articles: [], articleCache: {} });
 var database;
 function openDatabase() {
   if (!database)
@@ -202,6 +202,46 @@ async function transact(owner, mutate) {
     );
   });
 }
+function firstBodyImage(raw) {
+  const text = String(raw || "");
+  const md = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/.exec(text);
+  if (md) return md[1];
+  const html = /<img[^>]*\bsrc=["']?(https?:\/\/[^"'\s>]+)/i.exec(text);
+  return html?.[1] || "";
+}
+function rememberCapture(library, article, body) {
+  if (!library.articleCache) library.articleCache = {};
+  const entry = { body: String(body || "").slice(0, 6e4), image: article.image || "", at: Date.now() };
+  if (article.url) library.articleCache[article.url] = entry;
+  if (article.identity) library.articleCache[article.identity] = entry;
+}
+function applyCachedBody(library, article) {
+  if (!article) return article;
+  if (!article.captured) {
+    const hit = article.url && library.articleCache?.[article.url] || article.identity && library.articleCache?.[article.identity];
+    if (hit?.body && hit.body.length > (article.body || "").length) {
+      article.body = hit.body;
+      article.captured = true;
+      if (hit.image && !article.image) article.image = hit.image;
+    }
+  }
+  if (article.captured && !article.image) {
+    const lead = firstBodyImage(article.body);
+    if (lead) article.image = lead;
+  }
+  return article;
+}
+function pruneArticleCache(library) {
+  if (!library.articleCache) return;
+  const live = new Set();
+  for (const article of library.articles) {
+    if (article.url) live.add(article.url);
+    if (article.identity) live.add(article.identity);
+  }
+  for (const key of Object.keys(library.articleCache)) {
+    if (!live.has(key)) delete library.articleCache[key];
+  }
+}
 function safeUrl(raw) {
   const url = new URL(raw);
   if (!["https:", "http:"].includes(url.protocol) || url.username || url.password || url.port && !["80", "443"].includes(url.port))
@@ -222,12 +262,23 @@ function mergeFeed(library, feedId, parsed) {
       byIdentity.set(article.identity, article);
   }
   let added = 0;
+  const fresh = [];
   for (const item of parsed.items) {
     const old = byIdentity.get(item.identity);
     if (old) {
       if (old.body !== item.body || old.title !== item.title || old.url !== item.url)
         old.actions = old.actions.map((a) => ({ ...a, stale: true }));
+      const prevBody = old.body;
+      const prevCaptured = old.captured;
+      const prevImage = old.image;
       Object.assign(old, item, { feed_title: feed.title });
+      if (prevCaptured || (prevBody && prevBody.length > (item.body || "").length)) {
+        old.body = prevBody;
+        old.captured = true;
+        old.image = prevImage || item.image;
+      }
+      applyCachedBody(library, old);
+      if (old.captured) rememberCapture(library, old, old.body);
     } else {
       const article = {
         ...item,
@@ -239,9 +290,11 @@ function mergeFeed(library, feedId, parsed) {
         actions: [],
         received_at: (/* @__PURE__ */ new Date()).toISOString()
       };
+      applyCachedBody(library, article);
       library.articles.push(article);
       byIdentity.set(item.identity, article);
       added++;
+      if (article.url && !article.captured) fresh.push(article);
     }
   }
   const unsaved = library.articles.filter((a) => a.feed_id === feedId && !a.is_saved).sort(
@@ -251,7 +304,8 @@ function mergeFeed(library, feedId, parsed) {
   );
   const remove = new Set(unsaved.slice(300).map((a) => a.id));
   library.articles = library.articles.filter((a) => !remove.has(a.id));
-  return { added };
+  pruneArticleCache(library);
+  return { added, fresh: fresh.map((a) => ({ id: a.id, url: a.url })) };
 }
 function parseOpml(content) {
   if (content.length > 2e6 || /<!DOCTYPE|<!ENTITY/i.test(content))
@@ -272,7 +326,7 @@ function parseOpml(content) {
   }));
 }
 var feedRefreshes = new Map();
-function createLibrary(owner, fetchFeed2, transaction = transact) {
+function createLibrary(owner, fetchFeed2, transaction = transact, captureFn = null) {
   const read = () => transaction(owner);
   const write = (change) => transaction(owner, change);
   const add = (library, input) => {
@@ -349,6 +403,13 @@ function createLibrary(owner, fetchFeed2, transaction = transact) {
             (a) => a.feed_id !== parts[1] || a.is_saved
           );
         });
+      if (parts[2] === "reorder" && method === "POST")
+        return write((library) => {
+          const order = Array.isArray(body.order) ? body.order : [];
+          if (order.length !== library.feeds.length || !order.every(id => typeof id === "string" && library.feeds.some(f => f.id === id)))
+            throw new Error("Order does not match the subscriptions.");
+          library.feeds.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+        });
       if (parts[2] === "refresh") {
         const key = JSON.stringify([owner, parts[1]]);
         if (feedRefreshes.has(key)) return feedRefreshes.get(key);
@@ -395,6 +456,19 @@ function createLibrary(owner, fetchFeed2, transaction = transact) {
             for (const key of ["is_saved", "is_read"])
               if (typeof body[key] === "boolean") article2[key] = body[key];
           });
+        if (parts[2] === "capture" && method === "POST")
+          return write((library2) => {
+            const article3 = library2.articles.find((a) => a.id === parts[1]);
+            if (!article3) throw new Error("Article not found.");
+            if (typeof body.body === "string" && body.body.length > article3.body.length) {
+              article3.body = body.body.slice(0, 6e4);
+              article3.captured = true;
+              const lead = firstBodyImage(article3.body);
+              if (lead) article3.image = lead;
+              article3.actions = article3.actions.map((a) => ({ ...a, stale: true }));
+              rememberCapture(library2, article3, article3.body);
+            }
+          });
         if (parts[2] === "actions" && method === "POST")
           return write((library2) => {
             const article2 = library2.articles.find((a) => a.id === parts[1]);
@@ -406,9 +480,10 @@ function createLibrary(owner, fetchFeed2, transaction = transact) {
             delete article2.actions[0].source_body;
             article2.actions = article2.actions.slice(0, 20);
           });
-        const article = (await read()).articles.find((a) => a.id === parts[1]);
+        const library = await read();
+        const article = library.articles.find((a) => a.id === parts[1]);
         if (!article) throw new Error("Article not found.");
-        return article;
+        return applyCachedBody(library, article);
       }
       const library = await read(), q = (url.searchParams.get("q") || "").trim().toLowerCase();
       const exclude = (url.searchParams.get("exclude") || "").trim().toLowerCase();
@@ -424,7 +499,10 @@ function createLibrary(owner, fetchFeed2, transaction = transact) {
         (a, b) => (b.published_at || b.received_at).localeCompare(
           a.published_at || a.received_at
         )
-      ).slice(0, Number(url.searchParams.get("limit")) || 100).map((a) => ({ ...a, excerpt: a.body.slice(0, 240) }));
+      ).slice(0, Number(url.searchParams.get("limit")) || 100).map((a) => {
+        applyCachedBody(library, a);
+        return { ...a, excerpt: plainText(a.body).slice(0, 240) };
+      });
     }
     if (path === "/opml/import") {
       const feeds = parseOpml(body.content);
@@ -446,7 +524,8 @@ function readSettings(ctx, owner) {
   return {
     autoRefresh: stored.autoRefresh === true,
     refreshMinutes: Number.isInteger(stored.refreshMinutes) && stored.refreshMinutes >= 1 && stored.refreshMinutes <= 1440 ? stored.refreshMinutes : 15,
-    markReadOnOpen: stored.markReadOnOpen !== false
+    markReadOnOpen: stored.markReadOnOpen !== false,
+    fullCapture: stored.fullCapture === true
   };
 }
 function currentOwner(host2) {
@@ -458,19 +537,24 @@ function publishLibraryChange(owner) {
 async function refreshSubscriptions(library, { feedId = null, shouldContinue = () => true } = {}) {
   const feeds = await library("/feeds");
   let added = 0, failed = 0;
+  const fresh = [];
   for (const feed of feeds) {
     if (!shouldContinue()) break;
     if (feedId && feed.id !== feedId) continue;
-    try { added += (await library(`/feeds/${feed.id}/refresh`, { method: "POST" })).added; }
+    try {
+      const result = await library(`/feeds/${feed.id}/refresh`, { method: "POST", body: {} });
+      added += result.added || 0;
+      if (Array.isArray(result.fresh)) fresh.push(...result.fresh);
+    }
     catch { failed++; }
   }
-  return { added, failed };
+  return { added, failed, fresh };
 }
 function startAutoRefresh(ctx, host2, options = {}) {
   const schedule = options.setInterval || setInterval;
   const unschedule = options.clearInterval || clearInterval;
   const now = options.now || Date.now;
-  const makeLibrary = options.makeLibrary || ((owner) => createLibrary(owner, url => fetchFeed(host2, url)));
+  const makeLibrary = options.makeLibrary || ((owner) => createLibrary(owner, url => fetchFeed(host2, url), transact, null));
   const notify = options.notify || publishLibraryChange;
   const clocks = new Map();
   let stopped = false, running = false;
@@ -495,7 +579,9 @@ function startAutoRefresh(ctx, host2, options = {}) {
       if (now() - Number(ctx.storage.get(`lastRefresh:${owner}`, 0)) < period) return;
       const canContinue = () => !stopped && currentOwner(host2) === owner && readSettings(ctx, owner).autoRefresh;
       if (!canContinue()) return;
-      await refreshSubscriptions(makeLibrary(owner), { shouldContinue: canContinue });
+      await refreshSubscriptions(makeLibrary(owner), { shouldContinue: canContinue }).then((result) => {
+        if (readSettings(ctx, owner).fullCapture && result.fresh?.length) captureEnqueue(owner, result.fresh);
+      });
       ctx.storage.set(`lastRefresh:${owner}`, now());
       if (!stopped) notify(owner);
     };
@@ -510,6 +596,105 @@ function startAutoRefresh(ctx, host2, options = {}) {
   const timer = schedule(() => { void tick(); }, 15000);
   void tick();
   return () => { stopped = true; unschedule(timer); };
+}
+
+var captureEnqueue = (owner, items, options) => 0;
+var captureActive = 0;
+var captureWaiters = [];
+function withCaptureSlot(work) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      captureActive++;
+      Promise.resolve().then(work).then(resolve, reject).finally(() => {
+        captureActive--;
+        const next = captureWaiters.shift();
+        if (next) next();
+      });
+    };
+    if (captureActive < 2) run();
+    else captureWaiters.push(run);
+  });
+}
+function startCaptureWorker(ctx, host2) {
+  let stopped = false;
+  const active = new Set();
+  const CONCURRENCY = 2;
+  const MAX_QUEUE = 80;
+  const MAX_ATTEMPTS = 2;
+  const storeKey = (owner) => `captureQueue:${owner}`;
+  const load = (owner) => {
+    const raw = ctx.storage.get(storeKey(owner), []) || [];
+    return Array.isArray(raw) ? raw.filter((j) => j && j.id && j.url) : [];
+  };
+  const save = (owner, q) => ctx.storage.set(storeKey(owner), q.slice(0, MAX_QUEUE));
+  const enqueue = (owner, items, { front = false } = {}) => {
+    if (stopped || !items?.length) return 0;
+    let q = load(owner);
+    const have = new Map(q.map((j) => [j.id, j]));
+    const incoming = [];
+    for (const item of items) {
+      if (!item?.id || !item?.url) continue;
+      if (have.has(item.id)) {
+        if (front) {
+          const existing = have.get(item.id);
+          q = [existing, ...q.filter((j) => j.id !== item.id)];
+        }
+        continue;
+      }
+      have.set(item.id, item);
+      incoming.push({ id: item.id, url: item.url, attempts: 0 });
+    }
+    if (incoming.length) q = front ? incoming.concat(q) : q.concat(incoming);
+    save(owner, q);
+    void pump();
+    return incoming.length;
+  };
+  async function pump() {
+    if (stopped) return;
+    const owner = currentOwner(host2);
+    while (!stopped && active.size < CONCURRENCY) {
+      const q = load(owner);
+      const job = q.find((j) => !active.has(j.id));
+      if (!job) break;
+      active.add(job.id);
+      void runJob(owner, job).finally(() => {
+        active.delete(job.id);
+        if (!stopped) void pump();
+      });
+    }
+  }
+  async function runJob(owner, job) {
+    const library = createLibrary(owner, (url2) => fetchFeed(host2, url2), transact);
+    try {
+      const article = await library(`/articles/${job.id}`);
+      if (!article?.url || article.captured) {
+        save(owner, load(owner).filter((j) => j.id !== job.id));
+        return;
+      }
+      const fullBody = await captureArticle(host2, job.url);
+      if (stopped || currentOwner(host2) !== owner) return;
+      if (fullBody && fullBody.length > (article.body || "").length) {
+        await library(`/articles/${job.id}/capture`, { method: "POST", body: { body: fullBody } });
+        publishLibraryChange(owner);
+      }
+      save(owner, load(owner).filter((j) => j.id !== job.id));
+    } catch {
+      if (stopped || currentOwner(host2) !== owner) return;
+      const q = load(owner);
+      const cur = q.find((j) => j.id === job.id);
+      if (!cur) return;
+      cur.attempts = (cur.attempts || 0) + 1;
+      if (cur.attempts >= MAX_ATTEMPTS) save(owner, q.filter((j) => j.id !== job.id));
+      else {
+        save(owner, q.filter((j) => j.id !== job.id).concat([cur]));
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+  }
+  captureEnqueue = enqueue;
+  void pump();
+  const timer = setInterval(() => { if (!stopped) void pump(); }, 4000);
+  return () => { stopped = true; clearInterval(timer); captureEnqueue = () => 0; };
 }
 
 // src/feed-transport.mjs
@@ -735,9 +920,12 @@ function parseFeed(xml, base) {
     } catch {
     }
     const content = child(entry, "encoded", "content") || child(entry, "description", "summary");
-    const body = plainText(
-      content?.children.length ? new XMLSerializer().serializeToString(content) : text(content)
-    ).slice(0, 16e3);
+    const rawContent = content?.children.length ? new XMLSerializer().serializeToString(content) : text(content);
+    const enclosure = [...entry.children].find((n) => n.localName === "enclosure" && /^image\//.test(n.getAttribute("type") || ""));
+    const mediaNode = [...entry.getElementsByTagName("*")].find((n) => /^media:thumbnail$|^media:content$/i.test(n.nodeName) && (n.getAttribute("url") || "").startsWith("http"));
+    const inlineImg = /<img[\s>][^>]*\bsrc=["']?(https?:\/\/[^"'\s>]+)/i.exec(rawContent || "")?.[1];
+    const image = enclosure?.getAttribute("url") || mediaNode?.getAttribute("url") || inlineImg || "";
+    const body = feedItemBody(rawContent);
     const title2 = plainText(text(child(entry, "title"))).slice(0, 1e3) || "Untitled article";
     const rawDate = text(
       child(entry, "published", "pubdate", "updated", "date")
@@ -748,20 +936,379 @@ function parseFeed(xml, base) {
       title: title2,
       url,
       body,
+      image,
       published_at: Number.isFinite(time) ? new Date(time).toISOString() : null
     };
   });
   return { title, items };
 }
+async function captureArticle(host2, rawUrl) {
+  const route = await currentRoute(host2);
+  const owner = JSON.stringify([route.connectionId, route.profile]);
+  return withCaptureSlot(() => captureArticleNow(host2, rawUrl, route, owner));
+}
+function httpsSrc(value) {
+  const v = String(value || "").trim();
+  if (!v || /^data:/i.test(v)) return "";
+  if (/^https?:\/\//i.test(v)) return v;
+  if (v.startsWith("//")) return "https:" + v;
+  return "";
+}
+function imgSrcFrom(el) {
+  const srcset = (el.getAttribute("srcset") || el.getAttribute("data-srcset") || "").split(",")[0].trim().split(/\s+/)[0];
+  for (const c of [el.getAttribute("src"), el.getAttribute("data-src"), el.getAttribute("data-original"), el.getAttribute("data-lazy-src"), srcset]) {
+    const u = httpsSrc(c);
+    if (u) return u;
+  }
+  return "";
+}
+function isTrackingPixel(el) {
+  return Number(el.getAttribute("width")) === 1 || Number(el.getAttribute("height")) === 1;
+}
+function tableToMarkdown(table) {
+  const rows = [...table.querySelectorAll("tr")].map((tr) =>
+    [...tr.children].filter((c) => /^(th|td)$/i.test(c.localName)).map((c) => c.textContent.replace(/\|/g, "\\|").replace(/\s+/g, " ").trim())
+  ).filter((r) => r.length);
+  if (!rows.length) return "";
+  const width = Math.max(...rows.map((r) => r.length));
+  const norm = rows.map((r) => {
+    const x = r.slice();
+    while (x.length < width) x.push("");
+    return x;
+  });
+  const head = norm[0];
+  const sep = head.map(() => "---");
+  return [`| ${head.join(" | ")} |`, `| ${sep.join(" | ")} |`, ...norm.slice(1).map((r) => `| ${r.join(" | ")} |`)].join("\n");
+}
+function inlineMarkdown(node) {
+  const clone = node.cloneNode(true);
+  for (const img of [...clone.querySelectorAll("img")]) {
+    if (isTrackingPixel(img)) { img.remove(); continue; }
+    const src = imgSrcFrom(img);
+    const alt = (img.getAttribute("alt") || "").replace(/[[\]]/g, "");
+    if (src) img.replaceWith(document.createTextNode(`![${alt}](${src})`));
+    else img.remove();
+  }
+  for (const a of [...clone.querySelectorAll("a[href]")]) {
+    const href = httpsSrc(a.getAttribute("href"));
+    const label = a.textContent.replace(/\s+/g, " ").trim() || href;
+    if (href) a.replaceWith(document.createTextNode(`[${label}](${href})`));
+    else a.replaceWith(document.createTextNode(a.textContent));
+  }
+  return clone.textContent.replace(/[^\S\n]+/g, " ").trim();
+}
+function extractReadable(html) {
+  const cleaned = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<noscript[\s\S]*?<\/noscript>/gi, "").replace(/<svg[\s\S]*?<\/svg>/gi, "").replace(/<form[\s\S]*?<\/form>/gi, "").replace(/<nav[\s\S]*?<\/nav>/gi, "").replace(/<aside[\s\S]*?<\/aside>/gi, "").replace(/<footer[\s\S]*?<\/footer>/gi, "").replace(/<!--[\s\S]*?-->/g, "");
+  const articleMatch = /<article[\s>][\s\S]*?<\/article>/i.exec(cleaned);
+  let scope = articleMatch ? articleMatch[0] : cleaned;
+  if (!articleMatch) {
+    const mainMatch = /<main[\s>][\s\S]*?<\/main>/i.exec(cleaned);
+    if (mainMatch) scope = mainMatch[0];
+  }
+  const template = document.createElement("template");
+  template.innerHTML = scope;
+  template.content.querySelectorAll("script,style,noscript,svg,form,iframe,button,input,select,textarea,nav,aside,footer,header,[aria-hidden=true]").forEach((n) => n.remove());
+  const nodes = [...template.content.querySelectorAll("p,li,blockquote,pre,h1,h2,h3,h4,img,figure,table")];
+  const parts = [];
+  const seen = new Set();
+  for (const node of nodes) {
+    if (node.closest("table") && node.localName !== "table") continue;
+    if (node.localName === "img" && node.closest("figure,p,li,h1,h2,h3,h4")) continue;
+    if (node.localName === "p" && node.closest("li,blockquote,figure")) continue;
+    if (node.localName === "table") {
+      const md = tableToMarkdown(node);
+      if (md) parts.push(md);
+      continue;
+    }
+    if (node.localName === "figure" || node.localName === "img") {
+      const img = node.localName === "img" ? node : node.querySelector("img");
+      if (!img || isTrackingPixel(img)) continue;
+      const src = imgSrcFrom(img);
+      if (!src) continue;
+      const cap = (node.querySelector && node.querySelector("figcaption")?.textContent.replace(/\s+/g, " ").trim()) || (img.getAttribute("alt") || "").replace(/[[\]]/g, "");
+      parts.push(`![${cap}](${src})`);
+      continue;
+    }
+    const name = node.localName;
+    const content = name === "pre" ? node.textContent.replace(/\s+$/g, "").trim() : inlineMarkdown(node);
+    if (!content || content.length < 2) continue;
+    if (content.length < 25 && !name.startsWith("h") && !/!\[/.test(content)) continue;
+    const key = content.slice(0, 80).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (name.startsWith("h")) parts.push(`## ${content}`);
+    else if (name === "li") parts.push(`\u2022 ${content}`);
+    else if (name === "blockquote") parts.push(`> ${content}`);
+    else if (name === "pre") parts.push("```\n" + content + "\n```");
+    else parts.push(content);
+  }
+  let text = "";
+  let prevLi = false;
+  for (const piece of parts) {
+    const isLi = piece.startsWith("\u2022 ");
+    const gap = text ? (prevLi && isLi ? "\n" : "\n\n") : "";
+    text += gap + piece;
+    prevLi = isLi;
+  }
+  return text.replace(/\n{3,}/g, "\n\n").trim();
+}
+async function captureArticleNow(host2, rawUrl, route, owner) {
+  const run = async (command, optional) => {
+    assertOwner(host2, route);
+    const result = await host2.requestProfile(route, "shell.exec", { command });
+    assertOwner(host2, route);
+    if (result.code !== 0) {
+      if (optional) return "";
+      throw new Error("Capture failed: the gateway needs curl plus gzip and base64 tools.");
+    }
+    return result.stdout.trim();
+  };
+  let family = families.get(owner);
+  if (!family) {
+    family = (await run("echo %OS%")) === "Windows_NT" ? "windows" : "posix";
+    families.set(owner, family);
+  }
+  let directory = caches.get(owner);
+  if (!directory) {
+    if (family === "windows") {
+      const temp = (await run("echo %TEMP%")).replace(/[\\/]+$/, "");
+      directory = `${temp}\\hermes-rss.${crypto.randomUUID().replaceAll("-", "").slice(0, 8)}`;
+      if (!isWindowsCache(directory))
+        throw new Error("Could not create a private RSS download cache.");
+      await run(`mkdir ${cmdQuote(directory)}`);
+    } else {
+      directory = await run("mktemp -d /tmp/hermes-rss.XXXXXXXX");
+      if (!isPosixCache(directory))
+        throw new Error("Could not create a private RSS download cache.");
+    }
+    caches.set(owner, directory);
+  }
+  const pagePath = family === "windows" ? `${directory}\\page` : `${directory}/page`;
+  const quote = family === "windows" ? cmdQuote : posixQuote;
+  const curl = family === "windows" ? "curl.exe" : "curl";
+  let url = publicUrl(rawUrl), success = false;
+  for (let redirect = 0; redirect < 4; redirect++) {
+    const addresses = await resolvePublicIPv4(run, family, url.hostname);
+    const port = url.port || (url.protocol === "https:" ? "443" : "80");
+    const info = await run(
+      `${curl} --disable --silent --show-error --noproxy ${quote("*")} --proto ${quote("=http,https")} --connect-timeout 8 --max-time 25 --max-filesize 2000000 --resolve ${quote(`${url.hostname}:${port}:${addresses[0]}`)} --location --header ${quote("Accept: text/html,application/xhtml+xml")} --header ${quote("Accept-Encoding: identity")} --user-agent ${quote("Mozilla/5.0 (compatible; HermesRSS/0.2; reader mode)")} --output ${quote(pagePath)} --write-out ${quote("%{http_code} %{size_download}")} --url ${quote(url.href)}`
+    );
+    const match = /^(\d{3}) ([0-9]+)$/.exec(info);
+    if (!match) throw new Error("Invalid page download response.");
+    const code = match[1], size = match[2];
+    if (Number(size) > 2e6) throw new Error("Page exceeds 2 MB.");
+    if (code !== "200") throw new Error(`The page returned HTTP ${code}.`);
+    success = true;
+    break;
+  }
+  if (!success) throw new Error("The page redirects too many times.");
+  const packed = await readPackedFeed(run, family, directory, pagePath);
+  const bytes = Uint8Array.from(atob(packed), (c) => c.charCodeAt(0));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  const decoded = new Uint8Array(await new Response(stream).arrayBuffer());
+  if (decoded.length > 2e6) throw new Error("Page exceeds 2 MB.");
+  const declared = /<meta[^>]+charset=["']?([\w-]+)/i.exec(new TextDecoder("utf-8").decode(decoded.slice(0, 4096)))?.[1];
+  const html = new TextDecoder(declared && !/utf-?8/i.test(declared) ? declared : "utf-8").decode(decoded);
+  const text = extractReadable(html);
+  if (!text || text.length < 200)
+    throw new Error("No readable article text found on the page.");
+  return text.slice(0, 6e4);
+}
+function escapeHtml(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function renderInline(escaped) {
+  return escaped
+    .replace(/!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g, '<img src="$2" alt="$1" loading="lazy">')
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>');
+}
+function feedItemBody(rawContent) {
+  const raw = String(rawContent || "");
+  if (!raw) return "";
+  if (!/<\/?(p|div|h[1-6]|ul|ol|li|img|a|blockquote|table|br|figure)\b/i.test(raw))
+    return plainText(raw).slice(0, 16e3);
+  const t = document.createElement("template");
+  t.innerHTML = raw;
+  let html = t.innerHTML;
+  const first = t.content.firstElementChild;
+  if (first && t.content.childElementCount === 1 && /content|encoded|description|summary/i.test(first.localName))
+    html = first.innerHTML;
+  return html.slice(0, 24e3);
+}
+function sanitizeRichHtml(source) {
+  const template = document.createElement("template");
+  template.innerHTML = source;
+  template.content.querySelectorAll("script,style,noscript,iframe,object,embed,form,button,input,select,textarea,link,meta,svg").forEach((n) => n.remove());
+  for (const image of [...template.content.querySelectorAll("img")]) {
+    if (isTrackingPixel(image)) { image.remove(); continue; }
+    const src = imgSrcFrom(image);
+    if (!src) { image.remove(); continue; }
+    image.setAttribute("src", src);
+    image.setAttribute("loading", "lazy");
+    if (!image.getAttribute("alt")) image.setAttribute("alt", "");
+  }
+  for (const node of template.content.querySelectorAll("*")) {
+    for (const attribute of [...node.attributes]) {
+      const name = attribute.name.toLowerCase();
+      const allowed = name === "href" && node.localName === "a" || name === "src" && node.localName === "img" || name === "alt" || name === "title" || name === "colspan" || name === "rowspan" || name === "loading" && node.localName === "img";
+      if (!allowed || name === "href" && !/^https?:/i.test(attribute.value) || name === "src" && !/^https?:/i.test(attribute.value))
+        node.removeAttribute(attribute.name);
+    }
+  }
+  for (const anchor of template.content.querySelectorAll("a[href]")) {
+    anchor.setAttribute("target", "_blank");
+    anchor.setAttribute("rel", "noreferrer noopener");
+  }
+  for (const table of [...template.content.querySelectorAll("table")]) {
+    if (table.parentElement && table.parentElement.classList.contains("rss-table-wrap")) continue;
+    const wrap = document.createElement("div");
+    wrap.className = "rss-table-wrap";
+    table.replaceWith(wrap);
+    wrap.appendChild(table);
+  }
+  return template.innerHTML;
+}
+function imageKey(url) {
+  const src = httpsSrc(url);
+  if (!src) return "";
+  try {
+    const parsed = new URL(src);
+    const path = parsed.pathname.replace(/\/+$/, "").toLowerCase().replace(/[-_]\d{2,5}x\d{2,5}(?=\.[a-z0-9]+$)/i, "");
+    return parsed.hostname.replace(/^www\./i, "").toLowerCase() + path;
+  } catch {
+    return src.split("?")[0].split("#")[0].toLowerCase();
+  }
+}
+function dedupeArticleImages(html, lead) {
+  const template = document.createElement("template");
+  const leadSrc = httpsSrc(lead);
+  template.innerHTML = (leadSrc ? `<p class="rss-lead"><img src="${escapeHtml(leadSrc)}" alt="" loading="lazy"></p>` : "") + String(html || "");
+  const seen = new Set();
+  for (const image of [...template.content.querySelectorAll("img")]) {
+    const key = imageKey(image.getAttribute("src"));
+    if (!key || seen.has(key)) {
+      const wrap = image.closest("p.rss-figure, p.rss-lead, figure");
+      if (wrap && wrap.querySelectorAll("img").length <= 1 && !wrap.textContent.trim()) wrap.remove();
+      else image.remove();
+      continue;
+    }
+    seen.add(key);
+  }
+  return template.innerHTML;
+}
+function withLeadImage(html, lead) {
+  return dedupeArticleImages(html, lead);
+}
+function mdTableHtml(rows) {
+  const cells = rows.map((r) => r.replace(/^\||\|$/g, "").split("|").map((c) => c.trim()));
+  if (cells.length < 2) return "";
+  const isSep = (row) => row.every((c) => /^:?-+:?$/.test(c.replace(/\s/g, "")));
+  let head = cells[0];
+  let body = cells.slice(1);
+  if (body[0] && isSep(body[0])) body = body.slice(1);
+  else { head = null; body = cells; }
+  const width = Math.max(...(head ? [head, ...body] : body).map((r) => r.length));
+  const pad = (r) => { const x = r.slice(); while (x.length < width) x.push(""); return x; };
+  const cell = (c) => `<td>${renderInline(escapeHtml(c))}</td>`;
+  let html = '<div class="rss-table-wrap"><table>';
+  if (head) html += "<thead><tr>" + pad(head).map((c) => `<th>${renderInline(escapeHtml(c))}</th>`).join("") + "</tr></thead>";
+  html += "<tbody>" + body.map((r) => "<tr>" + pad(r).map(cell).join("") + "</tr>").join("") + "</tbody></table></div>";
+  return html;
+}
+function bodyToRichHtml(raw, lead) {
+  const source = String(raw || "");
+  const looksLikeHtml = /<\/?(p|div|h[1-6]|ul|ol|li|img|a|blockquote|table|br|figure)\b/i.test(source);
+  if (looksLikeHtml) {
+    return { html: withLeadImage(sanitizeRichHtml(source), lead), isHtml: true };
+  }
+  const lines = source.split(/\n/);
+  const out = [];
+  let inList = false, inCode = false, codeBuffer = [], paragraph = [];
+  const flushParagraph = () => {
+    if (paragraph.length) { out.push(`<p>${renderInline(escapeHtml(paragraph.join(" ")))}</p>`); paragraph = []; }
+  };
+  const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+  for (let i = 0; i < lines.length; i++) {
+    const lineRaw = lines[i];
+    const line = lineRaw.replace(/\s+$/, "");
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      flushParagraph(); closeList();
+      if (inCode) { out.push(`<pre><code>${escapeHtml(codeBuffer.join("\n"))}</code></pre>`); codeBuffer = []; inCode = false; }
+      else inCode = true;
+      continue;
+    }
+    if (inCode) { codeBuffer.push(lineRaw); continue; }
+    if (!trimmed) { flushParagraph(); continue; }
+    const mdImg = /^!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)$/.exec(trimmed);
+    if (mdImg) {
+      flushParagraph(); closeList();
+      out.push(`<p class="rss-figure"><img src="${escapeHtml(mdImg[2])}" alt="${escapeHtml(mdImg[1])}" loading="lazy"></p>`);
+      continue;
+    }
+    if (/^\s*\|/.test(trimmed) && trimmed.indexOf("|", 1) !== -1) {
+      flushParagraph(); closeList();
+      const rows = [trimmed];
+      while (i + 1 < lines.length && /^\s*\|/.test(lines[i + 1]) && lines[i + 1].indexOf("|", 1) !== -1) {
+        i++;
+        rows.push(lines[i].trim());
+      }
+      const table = mdTableHtml(rows);
+      if (table) out.push(table);
+      else paragraph.push(trimmed);
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.*)$/.exec(trimmed);
+    if (heading) {
+      flushParagraph(); closeList();
+      const level = Math.min(4, heading[1].length);
+      out.push(`<h${level}>${renderInline(escapeHtml(heading[2]))}</h${level}>`);
+      continue;
+    }
+    const bullet = /^[-*\u2022+]\s+(.*)$/.exec(trimmed);
+    if (bullet) {
+      flushParagraph();
+      if (!inList) { out.push('<ul class="rss-list-md">'); inList = true; }
+      out.push(`<li>${renderInline(escapeHtml(bullet[1]))}</li>`);
+      continue;
+    }
+    const numbered = /^\d+[.)]\s+(.*)$/.exec(trimmed);
+    if (numbered) {
+      flushParagraph();
+      if (!inList) { out.push('<ul class="rss-list-md rss-ol">'); inList = true; }
+      out.push(`<li>${renderInline(escapeHtml(numbered[1]))}</li>`);
+      continue;
+    }
+    if (/^([-_=]\s?)\1{2,}$/.test(trimmed)) { flushParagraph(); closeList(); out.push("<hr>"); continue; }
+    if (/^&gt;|^>\s?/.test(trimmed)) {
+      flushParagraph(); closeList();
+      out.push(`<blockquote>${renderInline(escapeHtml(trimmed.replace(/^(&gt;|>)\s?/, "")))}</blockquote>`);
+      continue;
+    }
+    closeList();
+    paragraph.push(trimmed);
+  }
+  if (inCode) out.push(`<pre><code>${escapeHtml(codeBuffer.join("\n"))}</code></pre>`);
+  flushParagraph();
+  closeList();
+  return { html: withLeadImage(out.join(""), lead), isHtml: false };
+}
 
+// src/styles.mjs
 // src/styles.mjs
 var styles = `
 .hermes-rss {height:100%;min-height:520px;display:flex;flex-direction:column;color:var(--ui-text-primary,var(--foreground));font-size:13px;font-family:inherit}
 .hermes-rss *{box-sizing:border-box}.hermes-rss button,.hermes-rss input{font:inherit}
 .hermes-rss button{cursor:pointer}.hermes-rss button:disabled{opacity:.5;cursor:wait}
 .hermes-rss button:focus-visible,.hermes-rss input:focus-visible{outline:2px solid var(--ui-accent);outline-offset:3px}
-.hermes-rss .rss-top{display:flex;justify-content:space-between;align-items:center;padding:24px 28px 20px;border-bottom:1px solid var(--ui-stroke-secondary);gap:16px}
+.hermes-rss .rss-top{display:flex;justify-content:space-between;align-items:center;padding:10px 20px;border-bottom:1px solid var(--ui-stroke-secondary);gap:12px}
 .hermes-rss h1{font-size:24px;letter-spacing:-.8px;font-weight:650;margin:0 0 5px}.hermes-rss h2{font-size:20px;letter-spacing:-.4px;line-height:1.4;margin:0 0 12px}
+.hermes-rss .rss-top h1{font-size:15px;letter-spacing:-.2px;margin:0;line-height:1.3}
+.hermes-rss .rss-top .rss-tools{gap:6px}
+.hermes-rss .rss-top .rss-tools button{padding:4px 10px;font-size:12px;height:26px;min-height:0;line-height:1.2}
 .hermes-rss p{margin:0;line-height:1.7}.hermes-rss .rss-muted{color:var(--ui-text-secondary)}
 .hermes-rss .rss-eyebrow{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-weight:650;color:var(--ui-text-tertiary);margin-bottom:10px}
 .hermes-rss .rss-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -770,26 +1317,98 @@ var styles = `
 .hermes-rss .rss-nav button{display:flex;justify-content:space-between;align-items:center;width:100%;border:0;border-radius:6px;padding:9px 10px;background:transparent;color:var(--ui-text-secondary);text-align:left;margin-bottom:3px;gap:8px}
 .hermes-rss .rss-nav button[aria-current=true]{color:var(--ui-accent);background:color-mix(in srgb,var(--ui-accent) 10%,transparent)}
 .hermes-rss .rss-nav .rss-eyebrow{padding:0 10px;margin-top:28px}.hermes-rss .rss-count{font-size:11px;font-variant-numeric:tabular-nums}
+.hermes-rss .rss-nav-heading{display:flex;align-items:center;padding:0 2px 0 10px;margin-top:28px;min-height:16px;width:100%;box-sizing:border-box}
+.hermes-rss .rss-nav-heading .rss-eyebrow{padding:0;margin:0;letter-spacing:.8px;white-space:nowrap;flex:1;min-width:0;line-height:1;display:flex;align-items:center}
+.hermes-rss .rss-nav .rss-edit-toggle,.hermes-rss .rss-nav-heading .rss-edit-toggle{width:16px;height:16px;padding:0;margin:0 -10px 0 auto;flex:0 0 16px;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--ui-text-tertiary);line-height:1}
+.hermes-rss .rss-edit-toggle .codicon{font-size:9px;line-height:1;display:block}
+.hermes-rss .rss-edit-toggle[aria-pressed=true]{color:var(--ui-accent)}
+.hermes-rss .rss-feed-row{display:flex;align-items:center;gap:2px}
+.hermes-rss .rss-feed-row-editing{border-radius:6px}
+.hermes-rss .rss-feed-row-dragging{opacity:.45}
+.hermes-rss .rss-feed-edit{display:flex;align-items:center;flex-shrink:0}
+.hermes-rss .rss-feed-edit button{width:18px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--ui-text-tertiary);font-size:12px}
+.hermes-rss .rss-grip{cursor:grab}
 .hermes-rss .rss-feed-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hermes-rss .rss-list{border-right:1px solid var(--ui-stroke-secondary);display:flex;flex-direction:column;min-height:0}
-.hermes-rss .rss-list-head{padding:18px 18px 14px;border-bottom:1px solid var(--ui-stroke-secondary)}
+.hermes-rss .rss-list-head{padding:10px 12px;border-bottom:1px solid var(--ui-stroke-secondary);display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.hermes-rss .rss-list-head input{flex:1;min-width:120px;height:26px;padding:4px 8px;font-size:12px}
+.hermes-rss .rss-list-head .rss-list-meta{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.hermes-rss .rss-list-head .rss-mark-read{padding:4px 8px;font-size:11px;height:26px;min-height:0;line-height:1.2}
+.hermes-rss .rss-list-head .rss-filter-chips{margin-top:0}
+.hermes-rss .rss-detail{overflow:auto;padding:0;display:flex;flex-direction:column}
+.hermes-rss .rss-detail .rss-tools{margin:18px 0}
+.hermes-rss .rss-detail-inner{max-width:none;margin:0 auto;padding:32px 44px 56px;width:100%;box-sizing:border-box}
+.hermes-rss .rss-detail-inner > .rss-eyebrow,.hermes-rss .rss-detail-inner > h2,.hermes-rss .rss-detail-inner > .rss-body,.hermes-rss .rss-detail-inner > [role=tabpanel],.hermes-rss .rss-detail-inner > .rss-note{max-width:70ch;width:100%;margin-left:auto;margin-right:auto}
+.hermes-rss .rss-detail h2{font-size:24px;letter-spacing:-.3px;line-height:1.3;margin:6px 0 22px;font-weight:700}
+.hermes-rss .rss-detail .rss-eyebrow{margin-bottom:0}
+.hermes-rss .rss-detail .rss-body strong,.hermes-rss .rss-detail .rss-body b{font-weight:650}
+.hermes-rss .rss-detail .rss-body li::marker{color:var(--ui-text-tertiary)}
+.hermes-rss .rss-article-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0;margin:18px 0 0;flex-wrap:nowrap;width:100%;max-width:none}
+.hermes-rss .rss-icon-row{display:inline-flex;align-items:center;gap:2px}
+.hermes-rss .rss-icon-btn{width:24px;height:24px;padding:0;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:5px;background:transparent;color:var(--ui-text-secondary);font-size:14px}
+.hermes-rss .rss-icon-btn:hover:not(:disabled){color:var(--foreground);background:var(--chrome-action-hover)}
+.hermes-rss .rss-icon-btn:disabled{opacity:.4;cursor:default}
+.hermes-rss .rss-icon-btn-done{opacity:.4}
+.hermes-rss .rss-icon-btn-done:hover:not(:disabled){opacity:.7}
+.hermes-rss .rss-body{white-space:pre-wrap;font-size:15.5px;line-height:1.75;overflow-wrap:break-word;color:var(--ui-text-primary,var(--foreground));margin:22px 0 0;letter-spacing:.1px}
+.hermes-rss .rss-detail .rss-body p,.hermes-rss .rss-detail .rss-body h1,.hermes-rss .rss-detail .rss-body h2,.hermes-rss .rss-detail .rss-body h3,.hermes-rss .rss-detail .rss-body ul,.hermes-rss .rss-detail .rss-body ol,.hermes-rss .rss-detail .rss-body blockquote{margin:0 0 1.05em}
+.hermes-rss .rss-detail .rss-body h1{font-size:1.35em;line-height:1.3}
+.hermes-rss .rss-detail .rss-body h2{font-size:1.2em;line-height:1.35}
+.hermes-rss .rss-detail .rss-body h3{font-size:1.05em;line-height:1.4}
+.hermes-rss .rss-detail .rss-body ul,.hermes-rss .rss-detail .rss-body ol{padding-left:1.4em}
+.hermes-rss .rss-detail .rss-body li{margin:0;padding:0}
+.hermes-rss .rss-detail .rss-body li + li{margin-top:.15em}
+.hermes-rss .rss-detail .rss-body li > p{margin:0}
+.hermes-rss .rss-detail .rss-body blockquote{margin:1em 0;padding:2px 0 2px 14px;border-left:2px solid var(--ui-stroke-secondary);color:var(--ui-text-secondary);font-style:italic}
+.hermes-rss .rss-detail .rss-body a{color:var(--ui-accent);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--ui-accent) 40%,transparent)}
+.hermes-rss .rss-detail .rss-body code{font-size:.88em;background:color-mix(in srgb,var(--ui-text-secondary) 12%,transparent);border-radius:4px;padding:1px 5px}
+.hermes-rss .rss-detail .rss-body pre{background:color-mix(in srgb,var(--ui-text-secondary) 8%,transparent);border:1px solid var(--ui-stroke-secondary);border-radius:8px;padding:12px 14px;overflow:auto;white-space:pre-wrap}
+.hermes-rss .rss-detail .rss-body pre code{background:transparent;padding:0}
+.hermes-rss .rss-detail .rss-body img{max-width:100%;height:auto;display:block;margin:1.1em 0;border-radius:8px}
+.hermes-rss .rss-detail .rss-body hr{border:0;border-top:1px solid var(--ui-stroke-secondary);margin:1.6em 0}
+.hermes-rss .rss-lead,.hermes-rss .rss-figure{margin:0 0 1.25em}.hermes-rss .rss-lead img,.hermes-rss .rss-figure img{width:100%;margin:0}.hermes-rss .rss-table-wrap{overflow-x:auto;margin:1.1em 0;width:100%}.hermes-rss .rss-rich table{border-collapse:collapse;width:100%;margin:0;font-size:.92em}
+.hermes-rss .rss-rich th,.hermes-rss .rss-rich td{border:1px solid var(--ui-stroke-secondary);padding:6px 10px;text-align:left}
+.hermes-rss .rss-rich th{background:color-mix(in srgb,var(--ui-text-secondary) 8%,transparent);font-weight:650}
+.hermes-rss .rss-rich h4{font-size:1em;margin:1.2em 0 .5em}
+.hermes-rss .rss-rich{white-space:normal}
+.hermes-rss .rss-rich .rss-list-md{white-space:normal;list-style:disc outside;padding-left:1.5em;margin:0 0 1.05em}
+.hermes-rss .rss-rich .rss-list-md li{display:list-item;margin:0;padding:0;white-space:normal}
+.hermes-rss .rss-rich .rss-list-md li + li{margin-top:.15em}
+.hermes-rss .rss-rich .rss-list-md li::before{content:none}
+.hermes-rss .rss-rich .rss-list-md p,.hermes-rss .rss-rich li > p{margin:0;white-space:normal}
+.hermes-rss .rss-rich ul.rss-ol{list-style:decimal}
+.hermes-rss .rss-rich figcaption,.hermes-rss .rss-rich small{color:var(--ui-text-secondary);font-size:.85em}
+.hermes-rss .rss-settings-header{font-size:15px;font-weight:700;letter-spacing:-.2px;margin:4px 0 2px;color:var(--ui-text-primary,var(--foreground))}
+.hermes-rss .rss-settings-header:not(:first-child){margin-top:14px;padding-top:14px;border-top:1px solid var(--ui-stroke-secondary)}
+.hermes-rss .rss-setting-row{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.hermes-rss .rss-setting-row .rss-setting{margin:0}
+.hermes-rss .rss-setting-inline{display:inline-flex;align-items:center;gap:8px}
+.hermes-rss .rss-setting-inline input[type=number]{width:74px}
+.hermes-rss .rss-tabs-pills{display:inline-flex;gap:14px;margin:0;border:0;padding:0;justify-self:center}
+.hermes-rss .rss-tabs-pills button{border:0;background:transparent;border-radius:0;padding:2px 0;font-size:12px;line-height:1.4;color:var(--ui-text-secondary)}
+.hermes-rss .rss-tabs-pills button[aria-selected=true]{border-bottom:2px solid var(--ui-accent);background:transparent;color:var(--ui-text-primary,var(--foreground))}
 .hermes-rss .rss-list-items{overflow:auto;flex:1;padding:8px}
-.hermes-rss .rss-card{display:block;width:100%;border:1px solid transparent;background:transparent;color:inherit;text-align:left;padding:18px 14px;border-radius:8px;margin-bottom:3px}
+.hermes-rss .rss-card{display:block;width:100%;border:1px solid transparent;background:transparent;color:inherit;text-align:left;padding:18px 14px;border-radius:8px;margin-bottom:3px;outline:none;box-shadow:none}
+.hermes-rss .rss-list-items button.rss-card:focus,.hermes-rss .rss-list-items button.rss-card:focus-visible{outline:none;box-shadow:none;outline-offset:0}
+.hermes-rss .rss-list-items button.rss-card[aria-selected=true],.hermes-rss .rss-list-items button.rss-card[aria-selected=true]:focus,.hermes-rss .rss-list-items button.rss-card[aria-selected=true]:focus-visible{outline:2px solid var(--ui-accent);outline-offset:3px}
 .hermes-rss .rss-card:hover{background:color-mix(in srgb,var(--ui-text-secondary) 5%,transparent)}
 .hermes-rss .rss-card[aria-selected=true]{background:color-mix(in srgb,var(--ui-accent) 7%,transparent);border-color:color-mix(in srgb,var(--ui-accent) 24%,transparent)}
 .hermes-rss .rss-card-read .rss-card-title{color:var(--ui-text-secondary);font-weight:500}
 .hermes-rss .rss-card-read .rss-card-excerpt{color:var(--ui-text-tertiary)}
 .hermes-rss .rss-card-title{font-size:15px;font-weight:600;line-height:1.45;margin:8px 0}.hermes-rss .rss-card-meta{display:flex;justify-content:space-between;gap:10px;font-size:10px;color:var(--ui-text-tertiary)}
 .hermes-rss .rss-card-excerpt{font-size:12px;color:var(--ui-text-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.hermes-rss .rss-detail{overflow:auto;padding:28px 30px 48px}.hermes-rss .rss-detail .rss-tools{margin:18px 0}
+.hermes-rss .rss-card{flex-direction:row}
+.hermes-rss .rss-card-main{min-width:0;flex:1}
+.hermes-rss .rss-card-thumb{flex-shrink:0;width:56px;height:56px;border-radius:6px;overflow:hidden;margin-left:10px;background:color-mix(in srgb,var(--ui-text-secondary) 10%,transparent)}
+.hermes-rss .rss-card-thumb img{width:100%;height:100%;object-fit:cover;display:block}
 .hermes-rss .rss-chip{display:inline-flex;align-items:center;padding:4px 8px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;font-size:10px;color:var(--ui-text-secondary)}
 .hermes-rss .rss-tabs{display:flex;gap:22px;border-bottom:1px solid var(--ui-stroke-secondary);margin:24px 0}
 .hermes-rss .rss-tabs button{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--ui-text-secondary);padding:10px 0}
 .hermes-rss .rss-tabs button[aria-selected=true]{border-bottom-color:var(--ui-accent);color:var(--ui-text-primary,var(--foreground))}
-.hermes-rss .rss-body{white-space:pre-wrap;font-size:14px;line-height:1.85;overflow-wrap:anywhere}
 .hermes-rss .rss-empty{padding:48px 24px;text-align:center;max-width:450px;margin:auto}.hermes-rss .rss-empty-mark{font-size:32px;color:var(--ui-accent);margin-bottom:20px}
 .hermes-rss .rss-empty h2{font-size:19px}.hermes-rss .rss-empty p{color:var(--ui-text-secondary);margin:10px 0 18px}
 .hermes-rss .rss-notice{margin:0;padding:10px 24px;border-bottom:1px solid var(--ui-stroke-secondary);background:color-mix(in srgb,var(--ui-accent) 6%,transparent);font-size:12px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.hermes-rss .rss-notice-float{flex-shrink:0;border-radius:0;margin:0;box-shadow:none;border:0;border-bottom:1px solid var(--ui-stroke-secondary)}
 .hermes-rss .rss-notice-close{border:0;background:transparent;color:var(--ui-text-secondary);padding:2px 6px;font-size:16px;line-height:1;border-radius:4px}
 .hermes-rss .rss-notice-close:hover{background:color-mix(in srgb,var(--ui-text-secondary) 12%,transparent);color:var(--ui-text-primary,var(--foreground))}
 .hermes-rss .rss-note{padding:14px 16px;border:1px solid var(--ui-stroke-secondary);border-radius:8px;margin:18px 0;color:var(--ui-text-secondary);font-size:12px;line-height:1.7}
@@ -803,19 +1422,21 @@ var styles = `
 .hermes-rss .rss-feed-header-error{margin-top:8px;color:var(--ui-danger,var(--ui-text-secondary))}
 .hermes-rss .rss-settings{padding:18px 28px;border-bottom:1px solid var(--ui-stroke-secondary);display:grid;gap:16px}.hermes-rss .rss-settings h2{font-size:16px;margin:0}.hermes-rss .rss-setting{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.hermes-rss .rss-setting input[type=number]{width:90px}.hermes-rss .rss-setting input[type=checkbox]{accent-color:var(--ui-accent)}
 .hermes-rss .rss-settings-library{display:grid;gap:12px;padding-top:14px;border-top:1px solid var(--ui-stroke-secondary)}
-.hermes-rss .rss-filter-panel{display:grid;grid-template-columns:1fr 1fr;gap:20px;padding:18px 28px;border-bottom:1px solid var(--ui-stroke-secondary);max-height:45vh;overflow:auto;flex-shrink:0}
-.hermes-rss .rss-filter-column{display:grid;align-content:start;gap:10px;min-width:0}.hermes-rss .rss-filter-column h2{font-size:16px;margin:0}.hermes-rss .rss-filter-column input{min-width:0;max-width:100%}
+.hermes-rss .rss-filter-panel{display:grid;grid-template-columns:1fr 1fr;gap:10px 28px;padding:14px 28px;border-bottom:1px solid var(--ui-stroke-secondary);max-height:40vh;overflow:auto;flex-shrink:0}
+.hermes-rss .rss-filter-column{display:grid;align-content:start;gap:6px;min-width:0}.hermes-rss .rss-filter-column input,.hermes-rss .rss-filter-column select{min-width:0;max-width:100%;padding:4px 8px;font-size:12px;height:26px}
+.hermes-rss .rss-filter-panel button{padding:4px 10px;font-size:12px;height:26px;min-height:0;line-height:1.2}
+.hermes-rss .rss-filter-panel .rss-small{line-height:1.45}
 .hermes-rss select{font:inherit;color:inherit;background:var(--ui-bg-primary,var(--background));border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:7px;max-width:100%}
 .hermes-rss .rss-filter-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.hermes-rss .rss-filter-chips button{max-width:100%;white-space:normal;overflow-wrap:anywhere;text-align:left}
 @media(max-width:760px){.hermes-rss .rss-filter-panel{grid-template-columns:1fr}}
 .hermes-rss .rss-confirm{padding:16px 28px;border-bottom:1px solid var(--ui-stroke-secondary)}.hermes-rss .rss-confirm h2{font-size:16px}.hermes-rss .rss-confirm .rss-tools{margin-top:12px}
-@media(max-width:1000px){.hermes-rss .rss-layout{grid-template-columns:145px minmax(210px,.85fr) minmax(260px,1fr)}.hermes-rss .rss-detail{padding:22px 20px}.hermes-rss .rss-top{padding:20px}}
+@media(max-width:1000px){.hermes-rss .rss-layout{grid-template-columns:145px minmax(210px,.85fr) minmax(260px,1fr)}.hermes-rss .rss-detail-inner{padding:22px 20px}.hermes-rss .rss-top{padding:20px}}
 @media(max-width:760px){.hermes-rss .rss-layout{grid-template-columns:125px 1fr}.hermes-rss .rss-detail{display:none}.hermes-rss .rss-layout.has-selection .rss-list{display:none}.hermes-rss .rss-layout.has-selection .rss-detail{display:block}.hermes-rss .rss-top{align-items:flex-start}.hermes-rss .rss-top p{display:none}}
 `;
 
 // src/plugin.jsx
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var ID = "hermes-rss";
+var ID = "hermes-rss-reader";
 var labels = {
   supported: "Supported by retrieved evidence",
   conflicting: "Conflicting evidence",
@@ -859,7 +1480,7 @@ function Reader({ ctx }) {
 function ReaderProfile({ ctx, owner }) {
   const inFlight = useRef(false);
   const library = useMemo(
-    () => createLibrary(owner, (url2) => fetchFeed(host, url2)),
+    () => createLibrary(owner, (url2) => fetchFeed(host, url2), transact, (pageUrl) => captureArticle(host, pageUrl)),
     [owner]
   );
   const libraryRequest = async (...args) => {
@@ -897,6 +1518,11 @@ function ReaderProfile({ ctx, owner }) {
   const [settings, setSettings] = useState(() => readSettings(ctx, owner));
   const [draft, setDraft] = useState(() => readSettings(ctx, owner));
   const [feedToRemove, setFeedToRemove] = useState(null);
+  const [reorderMode, setReorderMode] = useState(false);
+  const [dragOrder, setDragOrder] = useState(null);
+  const [draggingId, setDraggingId] = useState(null);
+  const dragOrderRef = useRef(null);
+  const dragFeedId = useRef(null);
   const confirmation = useRef(null);
   useEffect(() => { if (feedToRemove) confirmation.current?.focus(); }, [feedToRemove]);
   useEffect(() => {
@@ -990,6 +1616,7 @@ function ReaderProfile({ ctx, owner }) {
   const openArticle = (item) => {
     setSelected(item.id);
     setTab("article");
+    if (settings.fullCapture && item.url && !item.captured) captureEnqueue(owner, [{ id: item.id, url: item.url }], { front: true });
     if (!settings.markReadOnOpen || item.is_read) return;
     // Update all cached views immediately, then persist through the same library.
     client.setQueriesData({ queryKey: [...key, "articles"] }, rows =>
@@ -1004,14 +1631,72 @@ function ReaderProfile({ ctx, owner }) {
   };
   const refreshFeeds = async () => {
     const result = await refreshSubscriptions(libraryRequest, {
-      feedId, shouldContinue: () => currentOwner(host) === owner
+      feedId,
+      shouldContinue: () => currentOwner(host) === owner
     });
     if (!feedId) ctx.storage.set(`lastRefresh:${owner}`, Date.now());
-    setNotice(`${result.added} new articles${result.failed ? ` · ${result.failed} feeds could not refresh. Select a feed for details.` : " · Up to date."}`);
+    const queued = settings.fullCapture && result.fresh?.length ? captureEnqueue(owner, result.fresh) : 0;
+    setNotice(`${result.added} new articles${result.failed ? ` · ${result.failed} feeds could not refresh. Select a feed for details.` : " · Up to date."}${queued ? ` · Capturing ${queued} in the background.` : ""}`);
   };
   const markAllRead = () => act("Marking read…", async () => {
     const result = await libraryRequest("/articles/read-all", { method: "POST", body: { feed_id: feedId } });
     setNotice(`${result.count} article${result.count === 1 ? "" : "s"} marked as read.`);
+  });
+  const captureOpen = () => {
+    const target = article;
+    if (!target?.url) return;
+    void act("Capturing full article\u2026", async () => {
+      const fullBody = await captureArticle(host, target.url);
+      if (!fullBody || fullBody.length <= target.body.length) return;
+      await libraryRequest(`/articles/${target.id}/capture`, { method: "POST", body: { body: fullBody } });
+    });
+  };
+  const articleList = articles.data || [];
+  const selectedIndex = selected ? articleList.findIndex(a => a.id === selected) : -1;
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) return;
+      const list = articleList;
+      if (!list.length) return;
+      if (event.key === "j" || event.key === "k") {
+        const step = event.key === "j" ? 1 : -1;
+        let next = selectedIndex < 0 ? (step > 0 ? 0 : list.length - 1) : Math.min(list.length - 1, Math.max(0, selectedIndex + step));
+        const item = list[next];
+        if (item) {
+          event.preventDefault();
+          const focused = document.activeElement;
+          if (focused && focused.classList && focused.classList.contains("rss-card")) focused.blur();
+          openArticle(item);
+          requestAnimationFrame(() => {
+            const scroller = document.querySelector(".hermes-rss .rss-list-items");
+            const card = scroller?.querySelectorAll(".rss-card")[next];
+            if (!scroller || !card) return;
+            card.focus({ preventScroll: true });
+            const view = scroller.getBoundingClientRect();
+            const box = card.getBoundingClientRect();
+            const cardTop = box.top - view.top;
+            const cardBottom = cardTop + box.height;
+            const floor = view.height * 0.6;
+            let delta = 0;
+            if (cardTop < 0) delta = cardTop;
+            else if (cardBottom > floor) delta = cardBottom - floor;
+            if (delta) scroller.scrollTo({ top: scroller.scrollTop + delta, behavior: "smooth" });
+          });
+        }
+      } else if (event.key === "s" && article) {
+        event.preventDefault();
+        act("Saving…", () => libraryRequest(`/articles/${article.id}`, {
+          method: "PATCH", body: { is_saved: !article.is_saved }
+        }));
+      } else if (event.key === "d" && article && !disabled) {
+        event.preventDefault();
+        start("discuss");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   });
   const unsubscribe = () => act("Unsubscribing…", async () => {
     const removed = feedToRemove;
@@ -1021,6 +1706,38 @@ function ReaderProfile({ ctx, owner }) {
     setFeedToRemove(null);
     setNotice(`Unsubscribed from ${removed.title}. Saved articles and chats were kept.`);
   });
+  const displayedFeeds = (feeds.data || []).map(feed => ({
+    feed,
+    index: dragOrder ? dragOrder.indexOf(feed.id) : (feeds.data || []).indexOf(feed)
+  })).sort((a, b) => a.index - b.index).map(entry => entry.feed);
+  const handleDragStart = feed => event => {
+    dragFeedId.current = feed.id;
+    setDraggingId(feed.id);
+    dragOrderRef.current = displayedFeeds.map(f => f.id);
+    event.dataTransfer.effectAllowed = "move";
+    try { event.dataTransfer.setData("text/plain", feed.id); } catch {}
+  };
+  const handleDragOver = () => event => {
+    if (!dragFeedId.current) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+  };
+  const handleDrop = feed => event => {
+    event.preventDefault();
+    const dragged = dragFeedId.current;
+    if (!dragged || dragged === feed.id) { setDraggingId(null); dragFeedId.current = null; setDragOrder(null); dragOrderRef.current = null; return; }
+    const order = (dragOrderRef.current || displayedFeeds.map(f => f.id)).filter(id => id !== dragged);
+    order.splice(displayedFeeds.findIndex(f => f.id === feed.id), 0, dragged);
+    setDragOrder(order);
+    setDraggingId(null);
+    dragFeedId.current = null;
+    dragOrderRef.current = null;
+    act("Reordering\u2026", async () => {
+      await libraryRequest("/feeds/reorder", { method: "POST", body: { order } });
+      refresh();
+      setDragOrder(null);
+    });
+  };
   const saveSettings = event => {
     event.preventDefault();
     const minutes = Number(draft.refreshMinutes);
@@ -1031,6 +1748,10 @@ function ReaderProfile({ ctx, owner }) {
     ctx.storage.set(`settings:${owner}`, next);
     setSettings(next);
     setDraft(next);
+    if (next.fullCapture) {
+      const backlog = (articles.data || []).filter((a) => a.url && !a.captured).slice(0, 40).map((a) => ({ id: a.id, url: a.url }));
+      captureEnqueue(owner, backlog);
+    }
     publishLibraryChange(owner);
     setNotice("Reader settings saved.");
     setSettingsOpen(false);
@@ -1126,11 +1847,9 @@ function ReaderProfile({ ctx, owner }) {
   return /* @__PURE__ */ jsxs("section", { className: "hermes-rss", "aria-label": "RSS reader", children: [
     /* @__PURE__ */ jsx("style", { children: styles }),
     /* @__PURE__ */ jsxs("header", { className: "rss-top", children: [
-      /* @__PURE__ */ jsxs("div", { children: [
-        /* @__PURE__ */ jsx("div", { className: "rss-eyebrow", children: "Your sources. Your perspective." }),
-        /* @__PURE__ */ jsx("h1", { children: "RSS" }),
-        /* @__PURE__ */ jsx("p", { className: "rss-muted", children: "A little less noise. A little more understanding." })
-      ] }),
+      /* @__PURE__ */ jsx("div", { children:
+        /* @__PURE__ */ jsx("h1", { children: "RSS Reader" })
+      }),
       /* @__PURE__ */ jsxs("div", { className: "rss-tools", children: [
         /* @__PURE__ */ jsx(
           Button,
@@ -1146,35 +1865,30 @@ function ReaderProfile({ ctx, owner }) {
         /* @__PURE__ */ jsx(Button, { onClick: () => setAdding(!adding), disabled, children: "+ Subscribe" })
       ] })
     ] }),
-    (busy || notice) && jsxs("div", { className: "rss-notice", role: "status", children: [
-      jsx("span", { children: busy || notice }),
-      notice && jsx("button", { type: "button", className: "rss-notice-close", "aria-label": "Dismiss notification", onClick: () => setNotice(""), children: "×" })
-    ] }),
     filtersOpen && jsxs("div", { className: "rss-filter-panel", "aria-label": "Filters and saved searches", children: [
       jsxs("div", { className: "rss-filter-column", children: [
-        jsx("h2", { children: "Current search" }),
+        jsx("h2", { className: "rss-settings-header", children: "Current search" }),
         jsxs("label", { className: "rss-stack", children: ["Exclude phrase", jsx(Input, { value: exclude, maxLength: 200, placeholder: "e.g. promo code", onChange: event => { setExclude(event.target.value); setLimit(100); } })] }),
-        jsx("p", { className: "rss-muted rss-small", children: "Search and exclusion match literal phrases in titles and feed text, ignoring case." }),
+        jsx("p", { className: "rss-muted rss-small", children: "Literal phrases in titles and feed text, ignoring case." }),
         jsxs("form", { className: "rss-tools", onSubmit: saveSearch, children: [
           jsx(Input, { "aria-label": "Saved search name", placeholder: "Name this search", value: searchName, maxLength: 200, required: true, onChange: event => setSearchName(event.target.value) }),
           jsx(Button, { type: "submit", disabled: disabled || !searchName.trim() || filters.isPending || !!filters.error, children: "Save search" })
         ] }),
-        jsx("p", { className: "rss-muted rss-small", children: "Saves the current phrase, exclusion, feed, view, and show-hidden choice." }),
         searches.map(search => jsxs("div", { className: "rss-tools", children: [
           jsx(Button, { variant: "ghost", onClick: () => openSearch(search), children: search.name }),
           jsx(Button, { variant: "ghost", disabled, "aria-label": `Remove saved search ${search.name}`, onClick: () => removeFilter("searches", search.id), children: "Remove" })
         ] }, search.id))
       ] }),
       jsxs("div", { className: "rss-filter-column", children: [
-        jsx("h2", { children: "Mute rules" }),
-        jsx("p", { className: "rss-muted rss-small", children: "Hide matching titles and feed text in every view. Nothing is deleted or marked read. Unread totals include hidden articles." }),
-        jsxs("form", { className: "rss-stack", onSubmit: addMute, children: [
+        jsx("h2", { className: "rss-settings-header", children: "Mute rules" }),
+        jsx("p", { className: "rss-muted rss-small", children: "Hides matches in every view. Unread counts still include them." }),
+        jsxs("form", { className: "rss-tools", onSubmit: addMute, children: [
           jsx(Input, { "aria-label": "Mute phrase", placeholder: "e.g. coupon", value: mutePhrase, maxLength: 200, required: true, onChange: event => setMutePhrase(event.target.value) }),
           jsxs("select", { "aria-label": "Mute rule feed", value: muteFeed, onChange: event => setMuteFeed(event.target.value), children: [
             jsx("option", { value: "", children: "All feeds" }),
             (feeds.data || []).map(feed => jsx("option", { value: feed.id, children: feed.title }, feed.id))
           ] }),
-          jsx(Button, { type: "submit", disabled: disabled || !mutePhrase.trim() || filters.isPending || !!filters.error, children: "Add mute rule" })
+          jsx(Button, { type: "submit", disabled: disabled || !mutePhrase.trim() || filters.isPending || !!filters.error, children: "Add mute" })
         ] }),
         mutes.map(rule => jsxs("div", { className: "rss-tools", children: [
           jsx("span", { className: "rss-small", children: `${rule.phrase} · ${rule.feed_id ? (feeds.data || []).find(feed => feed.id === rule.feed_id)?.title || "Removed feed" : "All feeds"}` }),
@@ -1186,21 +1900,36 @@ function ReaderProfile({ ctx, owner }) {
     ] }),
     settingsOpen && jsxs("div", { className: "rss-settings", children: [
       jsxs("form", { className: "rss-stack", "aria-label": "Reader settings", onSubmit: saveSettings, children: [
-        jsx("h2", { children: "Reader settings" }),
-        jsxs("label", { className: "rss-setting", children: [
-          jsx("input", { type: "checkbox", checked: draft.autoRefresh, disabled: typeof ctx.onDispose !== "function", onChange: event => setDraft({ ...draft, autoRefresh: event.target.checked }) }),
-          "Automatically refresh feeds"
+        jsx("h2", { className: "rss-settings-header", children: "Refreshing" }),
+        jsxs("div", { className: "rss-setting-row", children: [
+          jsx("label", { className: "rss-setting", children: [
+            jsx("input", { type: "checkbox", checked: draft.autoRefresh, disabled: typeof ctx.onDispose !== "function", onChange: event => setDraft({ ...draft, autoRefresh: event.target.checked }) }),
+            "Automatically refresh feeds"
+          ] }),
+          jsxs("label", { className: "rss-setting rss-setting-inline", children: [
+            "Every",
+            jsx(Input, { type: "number", min: 1, max: 1440, step: 1, required: true, "aria-label": "Refresh interval in minutes", value: draft.refreshMinutes, onChange: event => setDraft({ ...draft, refreshMinutes: event.target.value }) }),
+            "minutes"
+          ] })
         ] }),
-        jsxs("label", { className: "rss-setting", children: ["Every", jsx(Input, { type: "number", min: 1, max: 1440, step: 1, required: true, "aria-label": "Refresh interval in minutes", value: draft.refreshMinutes, onChange: event => setDraft({ ...draft, refreshMinutes: event.target.value }) }), "minutes"] }),
-        jsx("p", { className: "rss-muted rss-small", children: typeof ctx.onDispose === "function" ? "Refreshes the active profile while Hermes is open, even outside RSS. No AI calls run automatically. Settings apply to this profile." : "This Hermes version needs an SDK update for background refresh. Manual refresh still works." }),
-        jsxs("label", { className: "rss-setting", children: [
+        jsx("p", { className: "rss-muted rss-small", children: typeof ctx.onDispose === "function" ? "Runs while Hermes is open. No AI. This profile only." : "This Hermes version needs an SDK update for background refresh. Manual refresh still works." }),
+        jsx("h2", { className: "rss-settings-header", children: "Reading" }),
+        jsx("label", { className: "rss-setting", children: [
           jsx("input", { type: "checkbox", checked: draft.markReadOnOpen, onChange: event => setDraft({ ...draft, markReadOnOpen: event.target.checked }) }),
           "Mark articles as read when opened"
         ] }),
-        jsxs("div", { className: "rss-tools", children: [jsx(Button, { type: "submit", children: "Save settings" }), jsx(Button, { type: "button", variant: "ghost", onClick: () => setSettingsOpen(false), children: "Cancel" })] })
+        jsx("h2", { className: "rss-settings-header", children: "Capturing" }),
+        jsxs("div", { className: "rss-setting-row", children: [
+          jsx("label", { className: "rss-setting", children: [
+            jsx("input", { type: "checkbox", checked: draft.fullCapture, onChange: event => setDraft({ ...draft, fullCapture: event.target.checked }) }),
+            "Capture full articles in the background"
+          ] }),
+        ] }),
+        jsx("p", { className: "rss-muted rss-small", children: "Captures new posts after refresh. Kept until they leave the list." }),
+        jsx("div", { className: "rss-tools", children: [jsx(Button, { type: "submit", children: "Save settings" }), jsx(Button, { type: "button", variant: "ghost", onClick: () => setSettingsOpen(false), children: "Cancel" })] })
       ] }),
       jsxs("div", { className: "rss-settings-library", "aria-label": "Library", children: [
-        jsx("h2", { children: "Library" }),
+        jsx("h2", { className: "rss-settings-header", children: "Library" }),
         jsx("p", { className: "rss-muted rss-small", children: "Import or export subscriptions as OPML. This does not change refresh settings." }),
         jsxs("div", { className: "rss-tools", children: [
           jsx(Button, { type: "button", disabled, onClick: chooseFile, children: "Import OPML" }),
@@ -1295,8 +2024,21 @@ function ReaderProfile({ ctx, owner }) {
         )),
         searches.length > 0 && jsx("div", { className: "rss-eyebrow", children: "Saved searches" }),
         searches.map(search => jsx("button", { onClick: () => openSearch(search), title: search.name, children: jsx("span", { className: "rss-feed-name", children: search.name }) }, search.id)),
-        /* @__PURE__ */ jsx("div", { className: "rss-eyebrow", children: "Subscriptions" }),
-        (feeds.data || []).map(feed => jsxs("div", { className: "rss-feed-row", children: [
+        /* @__PURE__ */ jsxs("div", { className: "rss-nav-heading", children: [
+          /* @__PURE__ */ jsx("div", { className: "rss-eyebrow", children: "Subscriptions" }),
+          jsx("button", { className: "rss-edit-toggle", "aria-pressed": reorderMode, "aria-label": reorderMode ? "Exit edit mode" : "Edit subscriptions", title: reorderMode ? "Exit edit mode" : "Edit subscriptions", onClick: () => setReorderMode(!reorderMode), children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-pencil", "aria-hidden": "true" }) })
+        ] }),
+        (displayedFeeds || []).map((feed) => jsxs("div", {
+          className: `rss-feed-row${reorderMode ? " rss-feed-row-editing" : ""}${draggingId === feed.id ? " rss-feed-row-dragging" : ""}`,
+          draggable: reorderMode,
+          onDragStart: reorderMode ? handleDragStart(feed) : undefined,
+          onDragOver: reorderMode && draggingId ? handleDragOver() : undefined,
+          onDrop: reorderMode && draggingId ? handleDrop(feed) : undefined,
+          onDragEnd: () => { setDraggingId(null); dragFeedId.current = null; },
+          children: [
+          reorderMode && jsx("span", { className: "rss-feed-edit", children:
+            jsx("button", { className: "rss-grip", disabled: true, "aria-hidden": "true", tabIndex: -1, title: "Drag to reorder", children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-gripper", "aria-hidden": "true" }) })
+          }),
           jsxs("button", { className: "rss-feed-open", "aria-current": feedId === feed.id,
             title: `${feed.folder ? feed.folder + " / " : ""}${feed.title}`,
             onClick: () => selectView("all", feed.id), children: [
@@ -1306,7 +2048,7 @@ function ReaderProfile({ ctx, owner }) {
               ] }),
               jsx("span", { className: "rss-count", children: feed.unread || "" })
             ] }),
-          jsx("button", { className: "rss-unsubscribe", disabled, title: "Unsubscribe", "aria-label": `Unsubscribe from ${feed.title}`, onClick: () => setFeedToRemove(feed), children: "×" })
+          reorderMode && jsx("button", { className: "rss-unsubscribe rss-unsubscribe-edit", disabled, title: "Unsubscribe", "aria-label": `Unsubscribe from ${feed.title}`, onClick: () => setFeedToRemove(feed), children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-trash", "aria-hidden": "true" }) })
         ] }, feed.id)),
         !feeds.data?.length && /* @__PURE__ */ jsx("p", { className: "rss-muted rss-small", style: { padding: "0 10px" }, children: "Your feeds will appear here." })
       ] }),
@@ -1325,7 +2067,10 @@ function ReaderProfile({ ctx, owner }) {
               }
             }
           ),
-          jsxs("div", { className: "rss-filter-chips", "aria-label": "Active filters", children: [
+          /* @__PURE__ */ jsx("span", { className: "rss-list-meta", children:
+            /* @__PURE__ */ jsx("button", { type: "button", className: "rss-mark-read", disabled, onClick: markAllRead, "aria-label": feedId ? "Mark feed as read" : "Mark all as read", title: (feedId ? "Mark feed as read" : "Mark all as read") + " \u00b7 includes hidden articles and articles outside the current search.", children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-check-all", "aria-hidden": "true" }) })
+          }),
+          (query || exclude || feedId || view !== "all" || mutes.length > 0 || showHidden) && jsxs("div", { className: "rss-filter-chips", "aria-label": "Active filters", children: [
             query && jsx(Button, { size: "sm", variant: "outline", "aria-label": "Clear search phrase", onClick: () => { setQuery(""); setLimit(100); }, children: `Search: ${query} ×` }),
             exclude && jsx(Button, { size: "sm", variant: "outline", "aria-label": "Clear excluded phrase", onClick: () => { setExclude(""); setLimit(100); }, children: `Exclude: ${exclude} ×` }),
             feedId && jsx(Button, { size: "sm", variant: "outline", "aria-label": "Clear feed filter", onClick: () => selectView(view), children: `${chosenFeed?.title || "Removed feed"} ×` }),
@@ -1336,13 +2081,6 @@ function ReaderProfile({ ctx, owner }) {
             ] }),
             (query || exclude || feedId || view !== "all" || showHidden) && jsx(Button, { size: "sm", variant: "ghost", onClick: resetFilters, children: "Reset filters" })
           ] }),
-          /* @__PURE__ */ jsxs("p", { className: "rss-muted rss-small", style: { marginTop: 10 }, children: [
-            chosenFeed?.title || (view === "saved" ? "Saved for later" : view === "unread" ? "Unread articles" : "All articles"),
-            " ",
-            "\xB7 ",
-            articles.data?.length || 0
-          ] }),
-          jsx(Button, { variant: "ghost", size: "sm", disabled: disabled || !(feeds.data || []).some(f => (!feedId || f.id === feedId) && f.unread > 0) && !articles.data?.some(a => !a.is_read), onClick: markAllRead, title: "Includes hidden articles and articles outside the current search.", children: feedId ? "Mark feed as read" : "Mark all as read" }),
           chosenFeed?.error && /* @__PURE__ */ jsx("p", { role: "status", className: "rss-small rss-feed-header-error", children: chosenFeed.error })
         ] }),
         /* @__PURE__ */ jsxs("div", { className: "rss-list-items", children: [
@@ -1372,18 +2110,21 @@ function ReaderProfile({ ctx, owner }) {
               "aria-selected": selected === item.id,
               onClick: () => openArticle(item),
               children: [
-                /* @__PURE__ */ jsxs("div", { className: "rss-card-meta", children: [
-                  /* @__PURE__ */ jsxs("span", { children: [
-                    !item.is_read ? "\u25CF " : "",
-                    item.feed_title
+                /* @__PURE__ */ jsxs("div", { className: "rss-card-main", children: [
+                  /* @__PURE__ */ jsxs("div", { className: "rss-card-meta", children: [
+                    /* @__PURE__ */ jsxs("span", { children: [
+                      !item.is_read ? "\u25CF " : "",
+                      item.feed_title
+                    ] }),
+                    /* @__PURE__ */ jsx("span", { children: date(item.published_at) })
                   ] }),
-                  /* @__PURE__ */ jsx("span", { children: date(item.published_at) })
+                  /* @__PURE__ */ jsxs("div", { className: "rss-card-title", children: [
+                    item.title,
+                    item.is_saved ? " \u2606" : ""
+                  ] }),
+                  /* @__PURE__ */ jsx("p", { className: "rss-card-excerpt", children: item.excerpt })
                 ] }),
-                /* @__PURE__ */ jsxs("div", { className: "rss-card-title", children: [
-                  item.title,
-                  item.is_saved ? " \u2606" : ""
-                ] }),
-                /* @__PURE__ */ jsx("p", { className: "rss-card-excerpt", children: item.excerpt })
+                item.image && /* @__PURE__ */ jsx("span", { className: "rss-card-thumb", "aria-hidden": "true", children: /* @__PURE__ */ jsx("img", { src: item.image, alt: "", loading: "lazy", onError: (event) => { event.currentTarget.parentElement.style.display = "none"; } }) })
               ]
             },
             item.id
@@ -1391,102 +2132,151 @@ function ReaderProfile({ ctx, owner }) {
           articles.data?.length === limit && limit < 500 && /* @__PURE__ */ jsx(Button, { variant: "ghost", onClick: () => setLimit(limit + 100), children: "Load more" })
         ] })
       ] }),
-      /* @__PURE__ */ jsx("main", { className: "rss-detail", children: !selected ? /* @__PURE__ */ jsxs(Empty, { title: "Follow your curiosity", children: [
-        /* @__PURE__ */ jsx("p", { children: "Pick an article to read, unpack its ideas with Hermes, or look for evidence beyond the headline." }),
-        /* @__PURE__ */ jsx("div", { className: "rss-note", children: "AI runs only when you ask. Feed refresh uses standard network utilities on the connected gateway. Selected text goes to your configured model. Source checks use your Hermes web tools." })
-      ] }) : detail.isPending ? /* @__PURE__ */ jsx(Empty, { title: "Opening article\u2026" }) : detail.error ? /* @__PURE__ */ jsxs(Empty, { title: "Article unavailable", children: [
-        /* @__PURE__ */ jsx("p", { children: "It may have been removed." }),
-        /* @__PURE__ */ jsx(Button, { onClick: () => setSelected(null), children: "Back to articles" })
-      ] }) : article && /* @__PURE__ */ jsxs(Fragment, { children: [
-        /* @__PURE__ */ jsx(
-          Button,
-          {
-            variant: "ghost",
-            size: "sm",
-            onClick: () => setSelected(null),
-            children: "\u2190 Articles"
-          }
-        ),
-        /* @__PURE__ */ jsxs("div", { className: "rss-eyebrow", style: { marginTop: 24 }, children: [
+      /* @__PURE__ */ jsxs("main", { className: "rss-detail", children: [
+        (busy || notice) && jsxs("div", { className: "rss-notice rss-notice-float", role: "status", children: [
+          jsx("span", { children: busy || notice }),
+          notice && jsx("button", { type: "button", className: "rss-notice-close", "aria-label": "Dismiss notification", onClick: () => setNotice(""), children: "×" })
+        ] }),
+        /* @__PURE__ */ jsx(Fragment, { children:
+        !selected ? /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsxs(Empty, { title: "Follow your curiosity", children: [
+          /* @__PURE__ */ jsx("p", { children: "Pick an article to read, unpack its ideas with Hermes, or look for evidence beyond the headline." }),
+          /* @__PURE__ */ jsx("div", { className: "rss-note", children: "AI runs only when you ask. Feed refresh uses standard network utilities on the connected gateway. Selected text goes to your configured model. Source checks use your Hermes web tools." })
+        ] }) }) :
+        detail.isPending ? /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsx(Empty, { title: "Opening article\u2026" }) }) :
+        detail.error ? /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsxs(Empty, { title: "Article unavailable", children: [
+          /* @__PURE__ */ jsx("p", { children: "It may have been removed." }),
+          /* @__PURE__ */ jsx(Button, { onClick: () => setSelected(null), children: "Back to articles" })
+        ] }) }) :
+        article && /* @__PURE__ */ jsx("div", { className: "rss-detail-inner", children: /* @__PURE__ */ jsxs(Fragment, { children: [
+        /* @__PURE__ */ jsxs("div", { className: "rss-eyebrow", style: { marginTop: 8 }, children: [
           article.feed_title,
           " \xB7 ",
           date(article.published_at)
         ] }),
-        /* @__PURE__ */ jsx("h2", { children: article.title }),
-        /* @__PURE__ */ jsxs("div", { className: "rss-tools", children: [
-          /* @__PURE__ */ jsx("span", { className: "rss-chip", children: "Feed excerpt" }),
+        /* @__PURE__ */ jsx("h2", { role: article.url ? "link" : undefined, style: article.url ? { cursor: "pointer" } : undefined, title: article.url ? "Open original" : undefined, onClick: article.url ? () => act("Opening\u2026", async () => {
+          if (!await ctx.os.openExternal(article.url))
+            throw new Error(
+              "Could not open the original article."
+            );
+        }) : undefined, children: article.title }),
+        /* @__PURE__ */ jsxs("div", { className: "rss-tools rss-article-actions", children: [
+          /* @__PURE__ */ jsxs("div", { className: "rss-icon-row", children: [
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled: !article.url,
+                "aria-label": "Open original",
+                title: "Open original",
+                onClick: () => act("Opening\u2026", async () => {
+                  if (!await ctx.os.openExternal(article.url))
+                    throw new Error(
+                      "Could not open the original article."
+                    );
+                }),
+                children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-link-external", "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled: disabled || !article.url,
+                "aria-label": "Copy link",
+                title: "Copy link",
+                onClick: () => act("Copying\u2026", async () => {
+                  await navigator.clipboard.writeText(article.url);
+                  setNotice("Article link copied.");
+                }),
+                children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-copy", "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled,
+                "aria-label": article.is_saved ? "Saved" : "Save",
+                title: article.is_saved ? "Saved" : "Save",
+                onClick: () => act(
+                  "Saving\u2026",
+                  () => libraryRequest(`/articles/${article.id}`, {
+                    method: "PATCH",
+                    body: { is_saved: !article.is_saved }
+                  })
+                ),
+                children: /* @__PURE__ */ jsx("i", { className: `codicon ${article.is_saved ? "codicon-save" : "codicon-save-as"}`, "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled,
+                "aria-label": article.is_read ? "Mark unread" : "Mark read",
+                title: article.is_read ? "Mark unread" : "Mark read",
+                onClick: () => act(
+                  "Updating\u2026",
+                  () => libraryRequest(`/articles/${article.id}`, {
+                    method: "PATCH",
+                    body: { is_read: !article.is_read }
+                  })
+                ),
+                children: /* @__PURE__ */ jsx("i", { className: `codicon ${article.is_read ? "codicon-eye-closed" : "codicon-mail-read"}`, "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: `rss-icon-btn${article.captured ? " rss-icon-btn-done" : ""}`,
+                disabled: disabled || !article.url,
+                "aria-label": article.captured ? "Recapture full article" : "Load full article",
+                title: article.captured ? "Recapture full article" : "Load full article from the original page",
+                onClick: captureOpen,
+                children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-cloud-download", "aria-hidden": "true" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                className: "rss-icon-btn",
+                disabled,
+                "aria-label": "Check sources",
+                title: "Check sources",
+                onClick: () => start("check"),
+                children: /* @__PURE__ */ jsx("i", { className: "codicon codicon-shield", "aria-hidden": "true" })
+              }
+            )
+          ] }),
           /* @__PURE__ */ jsx(
-            Button,
+            "div",
             {
-              size: "sm",
-              variant: "ghost",
-              disabled: !article.url,
-              onClick: () => act("Opening\u2026", async () => {
-                if (!await ctx.os.openExternal(article.url))
-                  throw new Error(
-                    "Could not open the original article."
-                  );
-              }),
-              children: "Open original \u2197"
+              className: "rss-tabs rss-tabs-pills",
+              role: "tablist",
+              "aria-label": "Article content",
+              children: [
+                ["article", "Article"],
+                ["summary", "Summary"],
+                ["evidence", "Evidence"]
+              ].map(([id, label]) => /* @__PURE__ */ jsx(
+                "button",
+                {
+                  role: "tab",
+                  "aria-selected": tab === id,
+                  onClick: () => setTab(id),
+                  children: label
+                },
+                id
+              ))
             }
           ),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              size: "sm",
-              variant: "ghost",
-              disabled: disabled || !article.url,
-              onClick: () => act("Copying\u2026", async () => {
-                await navigator.clipboard.writeText(article.url);
-                setNotice("Article link copied.");
-              }),
-              children: "Copy link"
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              size: "sm",
-              variant: "ghost",
-              disabled,
-              onClick: () => act(
-                "Saving\u2026",
-                () => libraryRequest(`/articles/${article.id}`, {
-                  method: "PATCH",
-                  body: { is_saved: !article.is_saved }
-                })
-              ),
-              children: article.is_saved ? "\u2605 Saved" : "\u2606 Save"
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              size: "sm",
-              variant: "ghost",
-              disabled,
-              onClick: () => act(
-                "Updating\u2026",
-                () => libraryRequest(`/articles/${article.id}`, {
-                  method: "PATCH",
-                  body: { is_read: !article.is_read }
-                })
-              ),
-              children: article.is_read ? "Mark unread" : "Mark read"
-            }
-          )
-        ] }),
-        /* @__PURE__ */ jsxs("div", { className: "rss-tools", children: [
-          /* @__PURE__ */ jsx(Button, { disabled, onClick: () => start("discuss"), children: "Discuss with Hermes \u2197" }),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              variant: "outline",
-              disabled,
-              onClick: () => start("check"),
-              children: "Check sources"
-            }
-          )
+          /* @__PURE__ */ jsx(Button, { disabled, onClick: () => start("discuss"), children: "Discuss \u2197" })
         ] }),
         latestChat && /* @__PURE__ */ jsx(
           Button,
@@ -1501,32 +2291,13 @@ function ReaderProfile({ ctx, owner }) {
             children: "Continue last conversation \u2197"
           }
         ),
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "rss-tabs",
-            role: "tablist",
-            "aria-label": "Article content",
-            children: [
-              ["article", "Article"],
-              ["summary", "Summary"],
-              ["evidence", "Evidence"]
-            ].map(([id, label]) => /* @__PURE__ */ jsx(
-              "button",
-              {
-                role: "tab",
-                "aria-selected": tab === id,
-                onClick: () => setTab(id),
-                children: label
-              },
-              id
-            ))
-          }
-        ),
-        tab === "article" && /* @__PURE__ */ jsxs("div", { role: "tabpanel", children: [
-          /* @__PURE__ */ jsx("p", { className: "rss-body", children: article.body || "This feed contains only a headline. Open the original article to read more." }),
-          /* @__PURE__ */ jsx("div", { className: "rss-note", children: "This is the text supplied by the feed. It may be an excerpt. Embedded scripts and remote images are not loaded." })
-        ] }),
+        tab === "article" && (() => {
+          const rich = bodyToRichHtml(article.body || "", article.image);
+          return /* @__PURE__ */ jsxs("div", { role: "tabpanel", children: [
+            rich.html ? /* @__PURE__ */ jsx("div", { className: "rss-body rss-rich", dangerouslySetInnerHTML: { __html: rich.html } }) : /* @__PURE__ */ jsx("p", { className: "rss-body", children: "This feed contains only a headline. Open the original article to read more." }),
+            !article.captured && /* @__PURE__ */ jsx("div", { className: "rss-note", children: rich.isHtml ? "Rendered from the feed's own HTML. Scripts are stripped and only https links and images survive sanitizing." : "This is the text supplied by the feed. It may be an excerpt. Scripts are stripped; https images and tables are kept." })
+          ] });
+        })(),
         tab === "summary" && /* @__PURE__ */ jsxs("div", { role: "tabpanel", children: [
           summary ? /* @__PURE__ */ jsxs(Fragment, { children: [
             /* @__PURE__ */ jsx("div", { className: "rss-eyebrow", children: "The short version" }),
@@ -1621,16 +2392,20 @@ function ReaderProfile({ ctx, owner }) {
           )
         ] }) })
       ] }) })
-    ] }),
-
+        })
+      ] })
+    ] })
   ] });
 }
 var plugin_default = {
   id: ID,
-  name: "RSS",
+  name: "RSS Reader",
+  description: "RSS reader with reader-mode capture, edit-mode subscriptions, and keyboard shortcuts.",
+  version: "1.0.0",
   defaultEnabled: true,
   register(ctx) {
     if (typeof ctx.onDispose === "function") ctx.onDispose(startAutoRefresh(ctx, host));
+    ctx.onDispose ? ctx.onDispose(startCaptureWorker(ctx, host)) : startCaptureWorker(ctx, host);
     ctx.register({
       id: "page",
       area: ROUTES_AREA,
@@ -1640,14 +2415,14 @@ var plugin_default = {
     ctx.register({
       id: "navigation",
       area: SIDEBAR_NAV_AREA,
-      data: { path: "/rss", label: "RSS", codicon: "rss" }
+      data: { path: "/rss", label: "RSS Reader", codicon: "rss" }
     });
     ctx.register({
       id: "open",
       area: PALETTE_AREA,
       data: {
         id: "hermes-rss.open",
-        label: "Open RSS reader",
+        label: "Open RSS Reader",
         keywords: ["feeds", "rss", "read"],
         run: () => host.navigate("/rss")
       }
