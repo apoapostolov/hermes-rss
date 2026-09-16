@@ -781,8 +781,13 @@ function parseFeed(xml, base) {
     } catch {
     }
     const content = child(entry, "encoded", "content") || child(entry, "description", "summary");
+    const rawContent = content?.children.length ? new XMLSerializer().serializeToString(content) : text(content);
+    const enclosure = [...entry.children].find((n) => n.localName === "enclosure" && /^image\//.test(n.getAttribute("type") || ""));
+    const mediaNode = [...entry.getElementsByTagName("*")].find((n) => /^media:thumbnail$|^media:content$/i.test(n.nodeName) && (n.getAttribute("url") || "").startsWith("http"));
+    const inlineImg = /<img[\s>][^>]*\bsrc=["']?(https?:\/\/[^"'\s>]+)/i.exec(rawContent || "")?.[1];
+    const image = enclosure?.getAttribute("url") || mediaNode?.getAttribute("url") || inlineImg || "";
     const body = plainText(
-      content?.children.length ? new XMLSerializer().serializeToString(content) : text(content)
+      rawContent || ""
     ).slice(0, 16e3);
     const title2 = plainText(text(child(entry, "title"))).slice(0, 1e3) || "Untitled article";
     const rawDate = text(
@@ -794,6 +799,7 @@ function parseFeed(xml, base) {
       title: title2,
       url,
       body,
+      image,
       published_at: Number.isFinite(time) ? new Date(time).toISOString() : null
     };
   });
@@ -907,13 +913,16 @@ async function captureArticleNow(host2, rawUrl, route, owner) {
   const text = extractReadable(html);
   if (!text || text.length < 200)
     throw new Error("No readable article text found on the page.");
-  return plainText(text).slice(0, 6e4);
+  const leadImage = /<img[^>]*\bsrc=["']?(https?:\/\/[^"'\s>]+)[^>]*>/i.exec(text)?.[1] || "";
+  const body = "![](" + leadImage + ")\n\n" + plainText(text).slice(0, 6e4);
+  return leadImage ? body : body.replace(/^!\[\]\([^)]*\)\n\n/, "");
 }
 function escapeHtml(value) {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 function renderInline(escaped) {
   return escaped
+    .replace(/!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g, '<img src="$2" alt="$1" loading="lazy">')
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
@@ -972,14 +981,14 @@ function bodyToRichHtml(raw) {
     const bullet = /^[-*\u2022+]\s+(.*)$/.exec(trimmed);
     if (bullet) {
       flushParagraph();
-      if (!inList) { out.push("<ul>"); inList = true; }
+      if (!inList) { out.push('<ul class="rss-list-md">'); inList = true; }
       out.push(`<li>${renderInline(escapeHtml(bullet[1]))}</li>`);
       continue;
     }
     const numbered = /^\d+[.)]\s+(.*)$/.exec(trimmed);
     if (numbered) {
       flushParagraph();
-      if (!inList) { out.push('<ul class="rss-ol">'); inList = true; }
+      if (!inList) { out.push('<ul class="rss-list-md rss-ol">'); inList = true; }
       out.push(`<li>${renderInline(escapeHtml(numbered[1]))}</li>`);
       continue;
     }
@@ -1017,8 +1026,8 @@ var styles = `
 .hermes-rss .rss-nav button[aria-current=true]{color:var(--ui-accent);background:color-mix(in srgb,var(--ui-accent) 10%,transparent)}
 .hermes-rss .rss-nav .rss-eyebrow{padding:0 10px;margin-top:28px}.hermes-rss .rss-count{font-size:11px;font-variant-numeric:tabular-nums}
 .hermes-rss .rss-nav-heading{position:relative;display:flex;align-items:center;padding:0 10px;margin-top:28px;min-height:14px}
-.hermes-rss .rss-nav-heading .rss-eyebrow{padding:0;margin:0;letter-spacing:.8px;white-space:nowrap}
-.hermes-rss .rss-nav-heading .rss-edit-toggle{position:absolute;right:10px;top:50%;transform:translateY(-50%)}
+.hermes-rss .rss-nav-heading .rss-eyebrow{padding:0;margin:0;letter-spacing:.8px;white-space:nowrap;margin-right:auto}
+.hermes-rss .rss-nav-heading .rss-edit-toggle{position:static;margin-left:auto;margin-top:2px}
 .hermes-rss .rss-edit-toggle{width:12px;height:12px;padding:0;margin:0;display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--ui-text-tertiary)}
 .hermes-rss .rss-edit-toggle .codicon{font-size:9px;line-height:1;display:block}
 .hermes-rss .rss-edit-toggle[aria-pressed=true]{color:var(--ui-accent)}
@@ -1038,7 +1047,7 @@ var styles = `
 .hermes-rss .rss-detail{overflow:auto;padding:32px 44px 56px}
 .hermes-rss .rss-detail .rss-tools{margin:18px 0}
 .hermes-rss .rss-detail-inner{max-width:70ch;margin:0 auto}
-.hermes-rss .rss-detail h2{font-size:24px;letter-spacing:-.3px;line-height:1.3;margin:6px 0 14px;font-weight:700}
+.hermes-rss .rss-detail h2{font-size:24px;letter-spacing:-.3px;line-height:1.3;margin:6px 0 22px;font-weight:700}
 .hermes-rss .rss-detail .rss-eyebrow{margin-bottom:0}
 .hermes-rss .rss-detail .rss-body strong,.hermes-rss .rss-detail .rss-body b{font-weight:650}
 .hermes-rss .rss-detail .rss-body li::marker{color:var(--ui-text-tertiary)}
@@ -1065,7 +1074,11 @@ var styles = `
 .hermes-rss .rss-rich th,.hermes-rss .rss-rich td{border:1px solid var(--ui-stroke-secondary);padding:6px 10px;text-align:left}
 .hermes-rss .rss-rich th{background:color-mix(in srgb,var(--ui-text-secondary) 8%,transparent);font-weight:650}
 .hermes-rss .rss-rich h4{font-size:1em;margin:1.2em 0 .5em}
-.hermes-rss .rss-rich ul.rss-ol{list-style:decimal;padding-left:1.4em}
+.hermes-rss .rss-rich .rss-list-md{white-space:normal;list-style:disc outside;padding-left:1.5em;margin:0 0 1.05em}
+.hermes-rss .rss-rich .rss-list-md li{display:list-item;margin:0 0 .35em;white-space:normal}
+.hermes-rss .rss-rich .rss-list-md li::before{content:none}
+.hermes-rss .rss-rich .rss-list-md p{margin:0;white-space:normal}
+.hermes-rss .rss-rich ul.rss-ol{list-style:decimal}
 .hermes-rss .rss-rich figcaption,.hermes-rss .rss-rich small{color:var(--ui-text-secondary);font-size:.85em}
 .hermes-rss .rss-settings-header{font-size:15px;font-weight:700;letter-spacing:-.2px;margin:4px 0 2px;color:var(--ui-text-primary,var(--foreground))}
 .hermes-rss .rss-settings-header:not(:first-child){margin-top:14px;padding-top:14px;border-top:1px solid var(--ui-stroke-secondary)}
@@ -1077,13 +1090,19 @@ var styles = `
 .hermes-rss .rss-tabs-pills button{border:0;background:transparent;border-radius:0;padding:2px 0;font-size:12px;line-height:1.4;color:var(--ui-text-secondary)}
 .hermes-rss .rss-tabs-pills button[aria-selected=true]{border-bottom:2px solid var(--ui-accent);background:transparent;color:var(--ui-text-primary,var(--foreground))}
 .hermes-rss .rss-list-items{overflow:auto;flex:1;padding:8px}
-.hermes-rss .rss-card{display:block;width:100%;border:1px solid transparent;background:transparent;color:inherit;text-align:left;padding:18px 14px;border-radius:8px;margin-bottom:3px}
+.hermes-rss .rss-card{display:block;width:100%;border:1px solid transparent;background:transparent;color:inherit;text-align:left;padding:18px 14px;border-radius:8px;margin-bottom:3px;outline:none}
+.hermes-rss .rss-card:focus:not(:focus-visible){outline:none}
+.hermes-rss .rss-card:focus-visible{outline:2px solid var(--ui-accent);outline-offset:-2px}
 .hermes-rss .rss-card:hover{background:color-mix(in srgb,var(--ui-text-secondary) 5%,transparent)}
 .hermes-rss .rss-card[aria-selected=true]{background:color-mix(in srgb,var(--ui-accent) 7%,transparent);border-color:color-mix(in srgb,var(--ui-accent) 24%,transparent)}
 .hermes-rss .rss-card-read .rss-card-title{color:var(--ui-text-secondary);font-weight:500}
 .hermes-rss .rss-card-read .rss-card-excerpt{color:var(--ui-text-tertiary)}
 .hermes-rss .rss-card-title{font-size:15px;font-weight:600;line-height:1.45;margin:8px 0}.hermes-rss .rss-card-meta{display:flex;justify-content:space-between;gap:10px;font-size:10px;color:var(--ui-text-tertiary)}
 .hermes-rss .rss-card-excerpt{font-size:12px;color:var(--ui-text-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.hermes-rss .rss-card{flex-direction:row}
+.hermes-rss .rss-card-main{min-width:0;flex:1}
+.hermes-rss .rss-card-thumb{flex-shrink:0;width:56px;height:56px;border-radius:6px;overflow:hidden;margin-left:10px;background:color-mix(in srgb,var(--ui-text-secondary) 10%,transparent)}
+.hermes-rss .rss-card-thumb img{width:100%;height:100%;object-fit:cover;display:block}
 .hermes-rss .rss-chip{display:inline-flex;align-items:center;padding:4px 8px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;font-size:10px;color:var(--ui-text-secondary)}
 .hermes-rss .rss-tabs{display:flex;gap:22px;border-bottom:1px solid var(--ui-stroke-secondary);margin:24px 0}
 .hermes-rss .rss-tabs button{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--ui-text-secondary);padding:10px 0}
@@ -1351,10 +1370,16 @@ function ReaderProfile({ ctx, owner }) {
           requestAnimationFrame(() => {
             const scroller = document.querySelector(".hermes-rss .rss-list-items");
             const card = scroller?.querySelector(`.rss-card[aria-selected="true"]`);
-            if (scroller && card) {
-              const top = card.offsetTop - scroller.clientHeight / 2 + card.clientHeight / 2;
-              scroller.scrollTo({ top, behavior: "smooth" });
-            }
+            if (!scroller || !card) return;
+            const view = scroller.getBoundingClientRect();
+            const box = card.getBoundingClientRect();
+            const cardTop = box.top - view.top;
+            const cardBottom = cardTop + box.height;
+            const floor = view.height * 0.6;
+            let delta = 0;
+            if (cardTop < 0) delta = cardTop;
+            else if (cardBottom > floor) delta = cardBottom - floor;
+            if (delta) scroller.scrollTo({ top: scroller.scrollTop + delta, behavior: "smooth" });
           });
         }
       } else if (event.key === "s" && article) {
@@ -1783,18 +1808,21 @@ function ReaderProfile({ ctx, owner }) {
               "aria-selected": selected === item.id,
               onClick: () => openArticle(item),
               children: [
-                /* @__PURE__ */ jsxs("div", { className: "rss-card-meta", children: [
-                  /* @__PURE__ */ jsxs("span", { children: [
-                    !item.is_read ? "\u25CF " : "",
-                    item.feed_title
+                /* @__PURE__ */ jsxs("div", { className: "rss-card-main", children: [
+                  /* @__PURE__ */ jsxs("div", { className: "rss-card-meta", children: [
+                    /* @__PURE__ */ jsxs("span", { children: [
+                      !item.is_read ? "\u25CF " : "",
+                      item.feed_title
+                    ] }),
+                    /* @__PURE__ */ jsx("span", { children: date(item.published_at) })
                   ] }),
-                  /* @__PURE__ */ jsx("span", { children: date(item.published_at) })
+                  /* @__PURE__ */ jsxs("div", { className: "rss-card-title", children: [
+                    item.title,
+                    item.is_saved ? " \u2606" : ""
+                  ] }),
+                  /* @__PURE__ */ jsx("p", { className: "rss-card-excerpt", children: item.excerpt })
                 ] }),
-                /* @__PURE__ */ jsxs("div", { className: "rss-card-title", children: [
-                  item.title,
-                  item.is_saved ? " \u2606" : ""
-                ] }),
-                /* @__PURE__ */ jsx("p", { className: "rss-card-excerpt", children: item.excerpt })
+                item.image && /* @__PURE__ */ jsx("span", { className: "rss-card-thumb", "aria-hidden": "true", children: /* @__PURE__ */ jsx("img", { src: item.image, alt: "", loading: "lazy", onError: (event) => { event.currentTarget.parentElement.style.display = "none"; } }) })
               ]
             },
             item.id
@@ -1824,7 +1852,6 @@ function ReaderProfile({ ctx, owner }) {
               "Could not open the original article."
             );
         }) : undefined, children: article.title }),
-        article.captured && jsx("span", { className: "rss-chip", style: { marginTop: 8, display: "inline-flex" }, children: "Full text" }),
         /* @__PURE__ */ jsxs("div", { className: "rss-tools rss-article-actions", children: [
           /* @__PURE__ */ jsxs("div", { className: "rss-icon-row", children: [
             /* @__PURE__ */ jsx(
